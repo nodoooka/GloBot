@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  # ==========================================
+  # 1. 消息与任务总线 (极致轻量，不到 50MB)
+  # ==========================================
+  redis-bus:
+    image: redis:7-alpine
+    container_name: ilife_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    networks:
+      - claw-net
+
+networks:
+  claw-net:
+    driver: bridge

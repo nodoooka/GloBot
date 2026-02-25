@@ -1,0 +1,72 @@
+# ==========================================
+# GloBot Matrix - 全局业务配置文件
+# ==========================================
+app:
+  name: "GloBot_Matrix"
+  version: "1.0.0"
+  description: "通用跨平台监控与媒体加工分发系统"
+
+# 1. 监控目标配置
+targets:
+  group_name: "iLiFE"             # ⚠️ 强烈建议不要带特殊符号(!)，避免跨平台路径报错
+  x_accounts:
+    - "iLiFE_official"
+    - "ice_icol"
+    - "iLiFE_riri"
+    - "iLiFE_wakaba"
+    - "iLiFE_mini"
+    - "iLiFE_fukumaru"
+    - "iLiFE_karen"
+    - "iLiFE_koguma"
+    - "iLiFE_sumire"
+    - "Haru_nonfic"
+    - "iLiFE_STAFF"
+
+# 2. 🕷️ 爬虫集群控制面板
+crawlers:
+  # 爬虫全局性能指标
+  global_settings:
+    max_retries: 3                  # 遇到死信前最多重试 3 次
+    scroll_timeout_ms: 4000         # 等待 GraphQL 响应的超时时间
+    scroll_depth: 3000              # Playwright 滚轮下滑深度
+  
+  # 平台独立开关
+  x_twitter:
+    enable: true
+    fetch_text: true     # 是否抓取推文正文
+    fetch_images: true   # 是否抓取并下载图片
+    fetch_videos: true   # 是否抓取并下载视频
+  tiktok:
+    enable: false
+  instagram:
+    enable: false
+  youtube:
+    enable: false
+
+# 3. 🧠 极客原生引擎 (Bot_Media)
+media_engine:
+  enable_ai_translation: true 
+  whisper_model: "mlx-community/whisper-large-v3-turbo"
+  ocr_iou_threshold: 0.8          # 时空过滤算法：重合度高于 80% 才认定为固定花字
+  ocr_min_height_ratio: 0.03      # 丢弃高度小于画面 3% 的背景碎字
+  hardware_encode_quality: 55     # VideoToolbox 压制质量 (越小越高，55为甜点值)
+
+# 4. 🚀 发布集群控制面板
+publishers:
+  bilibili:
+    # --- A. B站高级发布参数 ---
+    visibility: 1              # 0: 公开给所有人看, 1: 仅自己可见 (强烈建议测试期间保持为 1)
+    title: ""                  # 图文动态专用的标题 (20字以内, 选填)
+    allow_comment: true        # 是否允许粉丝评论
+    creation_declare: 2        # 创作声明 (1: 原创, 2: 转载/搬运)
+    schedule_time: ""          # 定时发布时间，留空则立即发布。格式为 "YYYY-MM-DD HH:MM:SS"
+
+    # --- B. 智能分发路由 (内容开关) ---
+    publish_text_image: true         # 默认开启：如果有图文/纯文本，则发布 B 站动态
+    publish_original_video: false    # 实验性：直接把没压字幕的生肉视频发出去
+    publish_translated_video: false  # 实验性：把 AI 翻译并压制好双语字幕的视频发出去
+
+# 5. SRE 稳定性监控阈值
+system:
+  max_ram_percent: 85.0           # 内存占用超过 85% 自动 Soft-Pause
+  max_temp_celsius: 75.0          # 温度超过 75℃ 自动报警并挂起
