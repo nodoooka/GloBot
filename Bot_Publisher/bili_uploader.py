@@ -147,9 +147,11 @@ async def publish_native_dynamic(text: str, image_paths: list = []):
         }
     }
     
-    # 标题挂载
+   # 标题挂载与防爆截断
     if cfg.title:
-        dyn_req["content"]["title"] = cfg.title
+        # 强制截断：规避 B 站可能存在的极其严格的隐藏字数/字节数限制 (保留前15个字符)
+        safe_title = cfg.title[:15]
+        dyn_req["content"]["title"] = safe_title
         
     # 图片挂载
     if uploaded_pics:
@@ -162,6 +164,11 @@ async def publish_native_dynamic(text: str, image_paths: list = []):
     payload = {
         "dyn_req": dyn_req
     }
+    
+    # 💡 调试探针：把即将发给 B 站的真实标题和长度打印出来
+    _debug_title = dyn_req.get("content", {}).get("title", "")
+    logger.info(f"   -> [调试探针] 实际即将发送的标题: '{_debug_title}' | 字符数: {len(_debug_title)} | 字节数: {len(_debug_title.encode('utf-8'))}")
+    # logger.info(f"   -> [调试探针] 完整 Payload: {json.dumps(payload, ensure_ascii=False)}")
     
     logger.info(f"   -> [执行] 正在发起 B站动态 POST 请求...")
     try:

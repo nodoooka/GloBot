@@ -7,8 +7,9 @@ app:
   description: "通用跨平台监控与媒体加工分发系统"
 
 # 1. 监控目标配置
+# 1. 监控目标配置
 targets:
-  group_name: "iLiFE"             # ⚠️ 强烈建议不要带特殊符号(!)，避免跨平台路径报错
+  group_name: "iLiFE"             
   x_accounts:
     - "iLiFE_official"
     - "ice_icol"
@@ -21,6 +22,19 @@ targets:
     - "iLiFE_sumire"
     - "Haru_nonfic"
     - "iLiFE_STAFF"
+  # 👇 新增：账号到动态标题的优雅映射字典
+  account_title_map:
+    ilife_official: "iLiFE!官方"
+    ilife_staff: "iLiFE!运营"
+    ice_icol: "🤍あいす(Aisu)"
+    ilife_riri: "❤️心花りり(Riri)"
+    ilife_wakaba: "💚若葉のあ(Noa)"
+    ilife_mini: "🩵虹羽みに(Mini)"
+    ilife_fukumaru: "💛福丸うさ(Usa)"
+    ilife_karen: "💙空詩かれん(Karen)"
+    ilife_koguma: "🧡小熊まむ(Mamu)"
+    ilife_sumire: "💜純嶺みき(Miki)"
+    haru_nonfic: "🩷恋星はるか(Haruka)"
 
 # 2. 🕷️ 爬虫集群控制面板
 crawlers:
