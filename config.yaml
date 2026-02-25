@@ -69,7 +69,7 @@ media_engine:
 publishers:
   bilibili:
     # --- A. B站高级发布参数 ---
-    visibility: 1              # 0: 公开给所有人看, 1: 仅自己可见 (强烈建议测试期间保持为 1)
+    visibility: 2              # 0: 公开给所有人看, 1: 仅自己可见 (强烈建议测试期间保持为 1)
     title: ""                  # 图文动态专用的标题 (20字以内, 选填)
     allow_comment: true        # 是否允许粉丝评论
     creation_declare: 2        # 创作声明 (1: 原创, 2: 转载/搬运)

@@ -5,6 +5,7 @@ from pathlib import Path
 from openai import AsyncOpenAI
 import sys
 import re
+import html
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from common.config_loader import settings, MASTER_LLM_API_KEY, WORKER_GLM_API_KEY
@@ -26,35 +27,55 @@ rag = RAGManager()
 
 # 单句翻译（保留给推文处理使用）
 async def translate_text(jp_text: str, is_subtitle: bool = False) -> str:
-    # ... (为了排版简洁，这部分逻辑与你之前相同，作为日常短推文的备用) ...
     if not jp_text.strip(): return ""
-    rag_context = rag.build_context_prompt(jp_text)
-    is_complex = len(jp_text) > 50 or ("【==== 专属知识库强制规范 ====】" in rag_context)
     
-    if is_complex and master_client:
-        active_client, active_model = master_client, MASTER_MODEL
-    else:
-        active_client, active_model = worker_client or master_client, WORKER_MODEL if worker_client else MASTER_MODEL
+    # 🧹 清洗推特底层的 HTML 转义字符 (如将 &lt; 还原为 < )，防止大模型抽风
+    clean_jp_text = html.unescape(jp_text)
+    
+    rag_context = rag.build_context_prompt(clean_jp_text)
+    
+    # 🚀 强制测试：无视长短，所有推文全部交给 Master 模型 (DeepSeek/GPT 等) 处理！
+    active_client, active_model = master_client, MASTER_MODEL
 
     system_prompt = (
         "你是一个精通日本地下偶像文化的专业翻译。\n"
-        "1. 严禁汉化成员名字！格式必须为：日文原文(罗马音)。\n"
-        "2. 严禁任何解释，直接输出翻译后的纯净文本。"
+        "任务：请将日文推文翻译成中文，要求自然、符合年轻粉丝的语气。\n"
+        "纪律1：严禁汉化成员名字！必须保持日文原文(罗马音)。\n"
+        "纪律2：直接输出中文翻译结果，【必须完全保留原文中的 Emoji 和颜文字】。严禁输出任何多余的解释、问候语或机器感的前言！"
     )
     
     try:
+        # 1. 组装要发送的完整消息体
+        messages_payload = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"请翻译以下内容：\n{clean_jp_text}\n\n{rag_context}"}
+        ]
+        
+        # 2. 🚦 增加通信探针：打印即将发给大模型的完整 JSON
+        import json
+        logger.info(f"   -> [大模型通信探针] 完整 Request Payload:\n{json.dumps(messages_payload, ensure_ascii=False, indent=2)}")
+        
+        # 3. 发送请求
         response = await active_client.chat.completions.create(
             model=active_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"翻译内容：\n{jp_text}\n\n{rag_context}"}
-            ],
+            messages=messages_payload,
             temperature=0.3, max_tokens=500
         )
-        return response.choices[0].message.content.strip()
+        
+        result = response.choices[0].message.content.strip()
+        
+        # 4. 🚦 增加响应探针：打印大模型真实返回的 Raw Data
+        logger.info(f"   -> [大模型通信探针] Raw Response: '{result}'")
+        
+        if not result:
+            logger.warning(f"⚠️ 大模型傲娇了，返回了空字符串！触发防爆兜底，直接使用清洗后的原文。")
+            return clean_jp_text
+            
+        return result
     except Exception as e:
         logger.error(f"❌ 翻译失败: {e}")
-        return jp_text
+        # 如果断网或 API 欠费，依然用原文兜底
+        return html.unescape(jp_text)
 
 # ==========================================
 # 🚀 工业级批处理：整片视频台词一次性翻译

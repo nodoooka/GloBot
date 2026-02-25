@@ -11,7 +11,6 @@ from datetime import datetime
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from common.config_loader import settings
 
-# 🌟 完美适配 Bot_Crawler
 from Bot_Crawler.media_downloader import download_media  
 
 # 🌟 GloBot 动态路径
@@ -34,8 +33,12 @@ def init_db():
 
 def find_tweets(obj):
     if isinstance(obj, dict):
-        if 'legacy' in obj and 'rest_id' in obj and 'core' in obj:
+        # 💣 核心修复：必须带有全景正文，或者显式声明类型是 Tweet，彻底排除 User 对象
+        is_tweet = 'Tweet' in str(obj.get('__typename', '')) or 'full_text' in obj.get('legacy', {})
+        
+        if is_tweet and 'legacy' in obj and 'rest_id' in obj and 'core' in obj:
             yield obj
+            
         for k, v in obj.items():
             yield from find_tweets(v)
     elif isinstance(obj, list):
@@ -68,7 +71,7 @@ async def parse_timeline_json(json_file_path: Path) -> list:
     cursor = conn.cursor()
     target_accounts = [acc.lower() for acc in settings.targets.x_accounts]
     
-    parsed_new_tweets = [] # 🌟 新增：用于收集要返回的新推文数据
+    parsed_new_tweets = []
 
     for tweet_node in find_tweets(data):
         tweet_id = tweet_node.get('rest_id')
@@ -85,22 +88,51 @@ async def parse_timeline_json(json_file_path: Path) -> list:
         if cursor.fetchone():
             continue
 
+        # ==========================================
+        # 🔪 暴力提取文本逻辑 (彻底根治长推文与引用推文丢失问题)
+        # ==========================================
         full_text = legacy.get('full_text', '')
+        
+        # 1. 兼容推特蓝V长推文 (Note Tweet)
+        try:
+            if 'note_tweet_results' in tweet_node:
+                note_text = tweet_node['note_tweet_results'].get('result', {}).get('text', '')
+                if note_text:
+                    full_text = note_text
+            elif 'note_tweet' in tweet_node: # 某些旧版 GraphQL 格式兼容
+                note_text = tweet_node['note_tweet'].get('note_tweet_results', {}).get('result', {}).get('text', '')
+                if note_text:
+                    full_text = note_text
+        except Exception:
+            pass
+            
+        # 2. 兼容引用推文 (Quote Tweet)
+        try:
+            if 'quoted_status_result' in tweet_node:
+                quote_legacy = tweet_node['quoted_status_result']['result']['legacy']
+                quote_text = quote_legacy.get('full_text', '')
+                if quote_text:
+                    full_text = full_text + f"\n\n【引用内容】:\n{quote_text}"
+        except Exception:
+            pass
+            
+        full_text = full_text.strip()
+        # ==========================================
+
         media_files = legacy.get('extended_entities', {}).get('media', [])
         
-        # 🌟 新增：解析推特原始时间戳
+        # 解析时间戳
         raw_created_at = legacy.get('created_at', '')
         try:
-            # 推特格式: "Wed Oct 10 20:19:24 +0000 2018"
             dt = datetime.strptime(raw_created_at, "%a %b %d %H:%M:%S %z %Y")
             timestamp_sec = int(dt.timestamp())
         except:
-            timestamp_sec = int(time.time()) # 解析失败兜底为当前时间
+            timestamp_sec = int(time.time()) 
         
         print(f"\n🌟 [新动态发现] 作者: @{author_screen_name} (ID: {tweet_id})")
         
         member_media_dir = FACTORY_DIR / "media" / author_screen_name
-        local_media_paths = [] # 🌟 新增：收集下载后的本地路径
+        local_media_paths = []
         
         img_count = 1
         for media in media_files:
@@ -124,7 +156,6 @@ async def parse_timeline_json(json_file_path: Path) -> list:
         cursor.execute("INSERT INTO tweets (tweet_id, author) VALUES (?, ?)", (tweet_id, author_screen_name))
         conn.commit()
 
-        # 🌟 新增：将组装好的数据塞入列表
         parsed_new_tweets.append({
             'id': tweet_id,
             'author': author_screen_name,
@@ -140,7 +171,7 @@ async def parse_timeline_json(json_file_path: Path) -> list:
     else:
         print(f"\n✅ 提纯与下载全部完成！共提取 {len(parsed_new_tweets)} 条全新动态。")
         
-    return parsed_new_tweets # 🌟 核心：把数据还给总控台！
+    return parsed_new_tweets
 
 if __name__ == "__main__":
     raw_dir = FACTORY_DIR / "timeline_raw"

@@ -19,6 +19,7 @@ class AppInfo(BaseModel):
 class TargetConfig(BaseModel):
     group_name: str
     x_accounts: list[str]
+    account_title_map: dict[str, str] = Field(default_factory=dict)
 
 class CrawlerGlobalSettings(BaseModel):
     max_retries: int = Field(default=3, ge=1, le=5) 
