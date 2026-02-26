@@ -52,12 +52,16 @@ def find_key(obj, target_key):
             if res is not None: return res
     return None
 
-# 🛠️ 新增：标准化的单节点推文提取器
 def extract_tweet_node(node):
     tweet_id = str(node.get('rest_id', ''))
     legacy = node.get('legacy', {})
     raw_screen_name = find_key(node.get('core', {}), 'screen_name')
     author_screen_name = str(raw_screen_name).lower() if raw_screen_name else ''
+    
+    # 👇 新增：精准提取底层的评论回复对象属性
+    raw_reply_name = legacy.get('in_reply_to_screen_name')
+    in_reply_to_screen_name = str(raw_reply_name).lower() if raw_reply_name else None
+    in_reply_to_status_id_str = legacy.get('in_reply_to_status_id_str')
     
     full_text = legacy.get('full_text', '')
     try:
@@ -69,7 +73,14 @@ def extract_tweet_node(node):
             if nt: full_text = nt
     except: pass
         
+    # 1. 干掉推特自带的 t.co 短链
     full_text = re.sub(r'https?://t\.co/\w+', '', full_text).strip()
+    
+    # 2. 🚨 精准外科手术：只在“评论回复”的场景下，切除推特底层强制塞入的 @账号标签！
+    # 这样就能完美保护普通推文中，偶像主动艾特别人（如摄影师、官方号）的正常交互。
+    if legacy.get('in_reply_to_status_id_str'):
+        full_text = re.sub(r'^(@\w+\s*)+', '', full_text).strip()
+
     media_files = legacy.get('extended_entities', {}).get('media', [])
     
     raw_created_at = legacy.get('created_at', '')
@@ -85,6 +96,8 @@ def extract_tweet_node(node):
         'text': full_text,
         'media_files_raw': media_files,
         'timestamp': timestamp_sec,
+        'in_reply_to_screen_name': in_reply_to_screen_name,
+        'in_reply_to_status_id_str': in_reply_to_status_id_str,
         'raw_node': node
     }
 
@@ -103,15 +116,24 @@ async def parse_timeline_json(json_file_path: Path) -> list:
         if target_info['author'] not in target_accounts: continue
         if 'retweeted_status_result' in tweet_node.get('legacy', {}): continue
             
+        # ==========================================
+        # 🚨 痛点修复：评论区回复的过滤与套娃
+        # ==========================================
+        reply_to_user = target_info.get('in_reply_to_screen_name')
+        if reply_to_user:
+            if reply_to_user not in target_accounts:
+                continue # 规则 1：彻底忽略成员对外部账号/路人粉丝的回复
+            else:
+                # 规则 2：成员间互相回复，伪装成引用转发，触发 B 站套娃！
+                target_info['quoted_tweet_id'] = target_info.get('in_reply_to_status_id_str')
+
         cursor.execute("SELECT 1 FROM tweets WHERE tweet_id = ?", (target_info['id'],))
         if cursor.fetchone(): continue
 
-        # 🚨 核心逻辑：沿着引用链向下穿透！
         quote_chain = []
         curr_node = tweet_node
         while True:
             q_res = curr_node.get('quoted_status_result', {}).get('result', {})
-            # 处理 Twitter 嵌套数据结构的恶心点
             if q_res.get('__typename') == 'TweetWithVisibilityResults':
                 q_res = q_res.get('tweet', {})
                 
@@ -119,23 +141,35 @@ async def parse_timeline_json(json_file_path: Path) -> list:
                 break
                 
             q_info = extract_tweet_node(q_res)
-            # 插入到头部，保证最老的根节点在最前面
+            
+            # 如果是带评论转发，记录直接父节点 ID (由于引用级别往往比普通的评论展示优先级高，所以覆盖团内回复)
+            if not quote_chain:
+                target_info['quoted_tweet_id'] = q_info['id']
+                target_info['quoted_text'] = q_info['text']
+                
             quote_chain.insert(0, q_info)
             curr_node = q_res
 
-        # 🖼️ 为链条上的每一个节点下载媒体文件
+        # 🖼️ 为链条上的每一个节点下载媒体文件并提取 ALT
         all_nodes = quote_chain + [target_info]
         for node in all_nodes:
             member_media_dir = FACTORY_DIR / "media" / node['author']
             member_media_dir.mkdir(parents=True, exist_ok=True)
             local_media = []
             img_count = 1
+            alt_texts = [] 
+            
             for media in node['media_files_raw']:
                 if media['type'] == 'photo':
                     orig_url = media['media_url_https'] + "?name=orig"
                     filename = f"{node['id']}_img{img_count}.jpg"
                     if await download_media(orig_url, member_media_dir, filename):
                         local_media.append(str(member_media_dir / filename))
+                    
+                    alt = media.get('ext_alt_text')
+                    if alt:
+                        alt_texts.append(f"【图{img_count}附言】\n{alt.strip()}")
+                        
                     img_count += 1
                 elif media['type'] in ['video', 'animated_gif']:
                     variants = media.get('video_info', {}).get('variants', [])
@@ -146,13 +180,15 @@ async def parse_timeline_json(json_file_path: Path) -> list:
                         filename = f"{node['id']}_video.mp4"
                         if await download_media(vid_url, member_media_dir, filename):
                             local_media.append(str(member_media_dir / filename))
+            
             node['media'] = local_media
+            
+            if alt_texts:
+                node['text'] += "\n\n" + "\n\n".join(alt_texts)
 
-        # 只记录目标成员的 ID，外部节点的 ID 靠 dyn_map 去重
         cursor.execute("INSERT INTO tweets (tweet_id, author) VALUES (?, ?)", (target_info['id'], target_info['author']))
         conn.commit()
 
-        # 将链条挂载到目标推文上
         target_info['quote_chain'] = quote_chain
         parsed_new_tweets.append(target_info)
 

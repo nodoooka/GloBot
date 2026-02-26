@@ -34,6 +34,10 @@ async def translate_text(jp_text: str, is_subtitle: bool = False) -> str:
     # 🧹 清洗推特底层的 HTML 转义字符 (如将 &lt; 还原为 < )，防止大模型抽风
     clean_jp_text = html.unescape(jp_text)
     
+    # 🏷️ 核心修复：用正则提前将推特单井号标签 #tag 转换为 B站双井号 #tag#
+    # 这样不仅适配了 B站格式，还能打断 Markdown 的标题语法，防止大模型跳过该行！
+    clean_jp_text = re.sub(r'#(\w+)', r'#\1#', clean_jp_text)
+    
     rag_context = rag.build_context_prompt(clean_jp_text)
     
     # 强制测试：无视长短，所有推文全部交给 Master 模型 (DeepSeek/GPT 等) 处理！
