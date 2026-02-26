@@ -25,7 +25,9 @@ master_client = AsyncOpenAI(api_key=MASTER_LLM_API_KEY, base_url=MASTER_BASE_URL
 
 rag = RAGManager()
 
-# 单句翻译（保留给推文处理使用）
+# ==========================================
+# 🚀 单句翻译（保留给推文处理使用）
+# ==========================================
 async def translate_text(jp_text: str, is_subtitle: bool = False) -> str:
     if not jp_text.strip(): return ""
     
@@ -34,21 +36,17 @@ async def translate_text(jp_text: str, is_subtitle: bool = False) -> str:
     
     rag_context = rag.build_context_prompt(clean_jp_text)
     
-    # 🚀 强制测试：无视长短，所有推文全部交给 Master 模型 (DeepSeek/GPT 等) 处理！
+    # 强制测试：无视长短，所有推文全部交给 Master 模型 (DeepSeek/GPT 等) 处理！
     active_client, active_model = master_client, MASTER_MODEL
 
-    system_prompt = (
-        "你是一个精通日本地下偶像文化的专业翻译。\n"
-        "任务：请将日文推文翻译成中文，要求自然、符合年轻粉丝的语气。\n"
-        "纪律1：严禁汉化成员名字！只有成员名字保持日文原文(罗马音)，其他任何内容都必须翻译为中文！\n"
-        "纪律2：直接输出中文翻译结果，【必须完全保留原文中的 Emoji 和颜文字】。严禁输出任何多余的解释、问候语或机器感的前言！"
-    )
+    # 🧠 核心重构：从 config.yaml 中动态读取对应的提示词
+    system_prompt = settings.prompts.video_translation_prompt if is_subtitle else settings.prompts.tweet_translation_prompt
     
     try:
-        # 1. 组装要发送的完整消息体
+        # 1. 组装要发送的完整消息体（加入物理边界符隔离）
         messages_payload = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"请翻译以下内容：\n{clean_jp_text}\n\n{rag_context}"}
+            {"role": "user", "content": f"请翻译以下推文：\n<text>\n{clean_jp_text}\n</text>\n\n{rag_context}"}
         ]
         
         # 2. 🚦 增加通信探针：打印即将发给大模型的完整 JSON
@@ -111,28 +109,15 @@ async def translate_batch(segments: list, ocr_results: list) -> list:
 
     logger.info(f"🧠 [智能路由] 正在将 {len(segments)} 句台本打包，移交【大师节点 {active_model}】...")
 
-    system_prompt = (
-        "你是一个资深影视本地化翻译兼地下偶像字幕组组长。请翻译以下视频台本。\n"
-        "【输入格式】每行一个序号，包含“听觉语音”以及方括号内的“[画面花字: 日文]”。\n"
-        "【翻译基准：导演思维与画面降噪】\n"
-        "1. 【听觉语音】优先级极高，同时也要参考画面花字。但你必须具备“人类观众的过滤本能”，如果画面花字的日文不是有明确含义的内容，或内容与上下文明显无关则会将其忽略！\n"
-        "2. 视频画面中经常会扫到各种应用界面、演职人员表或系统UI（如：主演、导演、电话号码、时间戳“今日 7:07”、系统提示“テキストメッセージ”等）。【绝对禁止】将这些无意义的UI碎片翻译出来！\n"
-        "3. 你必须精准提取画面花字中最核心的“剧情正文”（如短信的真实内容），忽略所有UI干扰项，并与听觉语音结合，【提炼、融合成唯一一句符合人类说话习惯的中文字幕】。\n"
-        "【最高输出纪律】\n"
-        "1. 严格按输入序号逐行返回，格式必须为：`序号. 中文翻译`。\n"
-        "2. 【绝对封杀机器味】：输出的最终字幕中，【绝对禁止】出现方括号 `[]`、竖线 `|` 等任何程序化的拼接符号！【绝对禁止】像报流水账一样列出画面元素！\n"
-        "3. 【彻底汉化法则】：日常称呼（如お姉ちゃん、先輩等）和普通名词必须翻译成中文！只有真正的偶像名字允许保留“日文原文(罗马音)”。\n"
-        "4. 输出中除偶像本人的名字外，【绝对禁止】出现其他日文，包括片假名和平假名！\n"
-        "5. 我只需要你吐出最终那一句精炼、纯净、有网感的中文字幕单句！\n"
-        "6. 在输出之前，我要你最后站在全局角度确认一遍全文翻译，根据上下文修正明显的错误，再一次确认除了真正的偶像名字外禁止出现非中文内容！"
-    )
+    # 🧠 核心重构：直接读取视频专属的提示词
+    system_prompt = settings.prompts.video_translation_prompt
 
     try:
         response = await active_client.chat.completions.create(
             model=active_model,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"请翻译以下台本：\n\n{script_text}\n\n{rag_context}"}
+                {"role": "user", "content": f"请翻译以下台本：\n<text>\n{script_text}\n</text>\n\n{rag_context}"}
             ],
             temperature=0.2, # 较低的温度确保结构稳定
             max_tokens=2000

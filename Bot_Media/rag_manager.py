@@ -84,8 +84,8 @@ class RAGManager:
 
         # 成员名称属于最高优先级，必须加上极其严厉的纪律警告
         if matched_members:
-            prompt_blocks.append("\n[1] ⚠️ 成员名字翻译纪律（最高优先级）：")
-            prompt_blocks.append("绝对禁止将成员名字汉化！必须保持日文原文不变，并在括号内加注罗马音。")
+            prompt_blocks.append("\n成员名字：")
+            prompt_blocks.append("如果名字后跟了たん、ちゃん、くん、さま (様)、さん、ちー等接尾辞，则要翻译为碳、酱、君、大人、亲、亲～")
             prompt_blocks.extend(matched_members)
 
         if matched_songs:

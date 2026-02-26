@@ -63,6 +63,11 @@ class BilibiliPublisherConfig(BaseModel):
 class PublishersConfig(BaseModel):
     bilibili: BilibiliPublisherConfig
 
+# 👇 新增：提示词配置数据模型
+class PromptsConfig(BaseModel):
+    tweet_translation_prompt: str
+    video_translation_prompt: str
+
 # 👑 全局顶层模型
 class AppConfig(BaseModel):
     app: AppInfo
@@ -71,6 +76,7 @@ class AppConfig(BaseModel):
     media_engine: MediaEngineConfig
     publishers: PublishersConfig
     system: SystemConfig
+    prompts: PromptsConfig  # 👈 新增：将提示词引擎接入全局配置
 
     # ==========================================
     # 🚨 核心黑科技：跨模块冲突拦截器 (防呆设计)

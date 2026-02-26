@@ -8,15 +8,12 @@ import html
 from pathlib import Path
 from datetime import datetime
 
-# ==========================================
-# 🧩 导入所有组件
-# ==========================================
 from common.config_loader import settings
 from Bot_Crawler.twitter_scraper import fetch_timeline
 from Bot_Crawler.tweet_parser import parse_timeline_json
 from Bot_Media.llm_translator import translate_text
 from Bot_Media.media_pipeline import dispatch_media
-from Bot_Publisher.bili_uploader import smart_publish
+from Bot_Publisher.bili_uploader import smart_publish, smart_repost # 引入原生转发模块
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("GloBot_Main")
@@ -24,62 +21,64 @@ logger = logging.getLogger("GloBot_Main")
 DATA_DIR = Path(os.getenv("LOCAL_DATA_DIR", f"./GloBot_Data/{settings.targets.group_name}"))
 RAW_DIR = DATA_DIR / "timeline_raw"
 HISTORY_FILE = DATA_DIR / "history.json"
+DYN_MAP_FILE = DATA_DIR / "dyn_map.json" # 新增：动态映射记忆表
 
-# 用于记录是否是项目有史以来第一次执行
 FIRST_RUN_FLAG_FILE = DATA_DIR / ".first_run_completed"
 
 def load_history():
-    """读取历史记录"""
-    if not HISTORY_FILE.exists():
-        return set()
+    if not HISTORY_FILE.exists(): return set()
     try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    except Exception as e:
-        logger.error(f"❌ 读取历史记录失败: {e}")
-        return set()
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f: return set(json.load(f))
+    except: return set()
 
 def save_history(history_set):
-    """持久化记录已发布的推文ID"""
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(list(history_set), f, ensure_ascii=False, indent=2)
 
-async def process_pipeline(tweet: dict) -> bool:
-    """全链路处理单条推文（翻译 -> 视频压制 -> 发布）"""
+def load_dyn_map():
+    if not DYN_MAP_FILE.exists(): return {}
+    try:
+        with open(DYN_MAP_FILE, "r", encoding="utf-8") as f: return json.load(f)
+    except: return {}
+
+def save_dyn_map(dyn_map):
+    DYN_MAP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(DYN_MAP_FILE, "w", encoding="utf-8") as f:
+        json.dump(dyn_map, f, ensure_ascii=False, indent=2)
+
+async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
     tweet_id = str(tweet['id'])
     author = str(tweet.get('author', '')).lower()
     raw_text = tweet.get('text', '')
-    media_files = tweet.get('media', [])  # 这已经是本地绝对路径列表了
+    quoted_tweet_id = tweet.get('quoted_tweet_id')
+    media_files = tweet.get('media', [])  
     timestamp = tweet.get('timestamp', int(time.time()))
     
     logger.info(f"\n" + "="*50)
     logger.info(f"🚀 开始处理推文 ID: {tweet_id} | 作者: @{author}")
     
-    # --- 1. 极其优雅的标题组装与防爆截断 ---
-    fallback_title = f"{settings.targets.group_name} 最新动态"
-    # 直接从 config.yaml 读取动态映射字典
-    raw_title = settings.targets.account_title_map.get(author, fallback_title)
+    # 🧠 核心判断：看看引用的这条推文，我们在 B 站发过没？
+    orig_dyn_id_str = dyn_map.get(quoted_tweet_id) if quoted_tweet_id else None
+
+    # 如果没有发过，或者干脆是外部成员推文，则降级为图文拼接兜底
+    if not orig_dyn_id_str and tweet.get('quoted_text'):
+        raw_text += f"\n\n【引用内容】:\n{tweet['quoted_text']}"
     
-    # ⚠️ 核心修复：B站 Opus 标题极短，强行保留前 15 个字符以防报 4126146
+    fallback_title = f"{settings.targets.group_name} 最新动态"
+    raw_title = settings.targets.account_title_map.get(author, fallback_title)
     safe_title = raw_title[:15] 
     settings.publishers.bilibili.title = safe_title
     logger.info(f"   -> [安全标题] 已设定为: '{safe_title}'")
     
-    # --- 2. 翻译正文 ---
     logger.info(f"   -> [探针] 爬虫提取到的原始日文: '{raw_text}'")
     translated_text = await translate_text(raw_text)
     logger.info(f"   -> [探针] LLM 返回的中译结果: '{translated_text}'")
     
-    # 3. 动态正文终极排版 (中日双语对照)
     dt_str = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
-    
-    # 清洗日文原文中的 HTML 转义符 (比如把 &lt; 还原成 <)，确保 B 站展示完美
     clean_raw_text = html.unescape(raw_text)
-    
     final_content = f"{dt_str}\n\n{translated_text}\n\n【原文】\n{clean_raw_text}\n\n{tweet_id}\n-由GloBot驱动"
 
-    # --- 4. 视频压制处理 (如果有视频的话) ---
     video_type = "none"
     final_media_paths = []
     
@@ -92,33 +91,35 @@ async def process_pipeline(tweet: dict) -> bool:
             output_file = PUBLISH_DIR / f"final_{source_file.name}"
             
             await dispatch_media(str(source_file))
-            
             if output_file.exists():
                 final_media_paths.append(str(output_file))
                 video_type = "translated" if settings.media_engine.enable_ai_translation else "original"
             else:
-                final_media_paths.append(str(source_file)) # 兜底用原视频
+                final_media_paths.append(str(source_file)) 
         else:
-            final_media_paths.append(mf) # 图片直接保留
+            final_media_paths.append(mf) 
             
-    # --- 5. 终极发射 ---
-    logger.info("   -> 移交发布中枢...")
-    success = await smart_publish(final_content, final_media_paths, video_type=video_type)
+    # 🚀 最终智能发射路由
+    if orig_dyn_id_str:
+        logger.info(f"   -> ♻️ 检测到成员带评论转发了已有动态！触发 B站原生转发功能！")
+        success, new_dyn_id = await smart_repost(final_content, orig_dyn_id_str)
+    else:
+        logger.info("   -> 移交图文/视频发布中枢...")
+        success, new_dyn_id = await smart_publish(final_content, final_media_paths, video_type=video_type)
     
-    # --- 6. 清理压制产物 ---
     for f in final_media_paths:
         if "ready_to_publish" in str(f):
             try: Path(f).unlink()
             except: pass
             
-    return success
+    return success, new_dyn_id
 
 async def main_loop():
     logger.info("🤖 GloBot 工业流水线已启动...")
     
-    # 判定是否为“真·首次启动”
     is_first_run = not FIRST_RUN_FLAG_FILE.exists()
     history_set = load_history()
+    dyn_map = load_dyn_map() # 🧠 加载 B 站动态映射记忆
     
     if is_first_run:
         logger.warning("🚨 检测到首次部署！首发截断保护机制已就绪。")
@@ -126,7 +127,7 @@ async def main_loop():
     while True:
         try:
             logger.info("\n📡 启动爬虫嗅探...")
-            await fetch_timeline()  # 执行 Playwright 动作，落盘 JSON
+            await fetch_timeline()
             
             json_files = list(RAW_DIR.glob("*.json"))
             if not json_files:
@@ -135,11 +136,8 @@ async def main_loop():
                 continue
                 
             latest_json = max(json_files, key=os.path.getmtime)
-            
-            # 拿到结构化的新推文列表
             new_tweets = await parse_timeline_json(latest_json)
             
-            # 🗑️ 阅后即焚：清理旧 JSON，但保留最新的一条方便调试
             for jf in json_files:
                 if jf.name != latest_json.name:
                     try: jf.unlink()
@@ -151,45 +149,39 @@ async def main_loop():
                 await asyncio.sleep(sleep_time)
                 continue
                 
-            # 按时间从旧到新排序，保证补发时间轴正确
             new_tweets.sort(key=lambda x: x['timestamp'])
             
-            # ==========================================
-            # 🛡️ 首次启动截断机制
-            # ==========================================
             if is_first_run:
                 logger.warning(f"🚨 [首发保护] 检测到首次启动，爬取到 {len(new_tweets)} 条历史推文，仅保留最新一条！")
-                
-                # 将除最后一条外的所有历史推文直接写入数据库
                 for t in new_tweets[:-1]:
                     history_set.add(str(t['id']))
                 save_history(history_set)
                 
                 new_tweets = [new_tweets[-1]]
-                
-                # 标记首次启动已完成
                 FIRST_RUN_FLAG_FILE.touch()
                 is_first_run = False
             else:
                 logger.info(f"🎯 待处理队列：{len(new_tweets)} 条动态")
 
-            # ==========================================
-            # 🔄 处理与冷却队列
-            # ==========================================
             total = len(new_tweets)
             for i, tweet in enumerate(new_tweets):
                 tweet_id = str(tweet['id'])
-                success = await process_pipeline(tweet)
+                success, new_dyn_id = await process_pipeline(tweet, dyn_map)
                 
                 if success:
                     history_set.add(tweet_id)
                     save_history(history_set)
-                    logger.info(f"✅ 任务 {i+1}/{total} [{tweet_id}] 成功发射！")
+                    
+                    # 🌟 成功发布后，持久化记录映射关系，为未来引用转发铺路
+                    if new_dyn_id:
+                        dyn_map[tweet_id] = new_dyn_id
+                        save_dyn_map(dyn_map)
+                        
+                    logger.info(f"✅ 任务 {i+1}/{total} [{tweet_id}] 成功发射！B站动态ID: {new_dyn_id}")
                 else:
                     logger.error(f"❌ 推文 {tweet_id} 发布失败，网络异常或触碰风控！")
-                    break # 跳出循环，等下个周期再试，防止白给
+                    break
                     
-                # 队列积压补发时，增加 1 分钟安全冷却
                 if i < total - 1:
                     logger.warning("⏳ [风控规避] 连续发送冷却中，休眠 65 秒...")
                     await asyncio.sleep(65)

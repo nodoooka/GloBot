@@ -33,8 +33,8 @@ COOKIE_STR = f"SESSDATA={SESSDATA}; bili_jct={BILI_JCT}; DedeUserID={DEDEUSERID}
 BILI_HEADERS = {
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "x-bili-mid": DEDEUSERID,
-    "app-key": "android64",  # 🚨 抓包核心：跨端伪装键
-    "env": "prod",           # 🚨 抓包核心：生产环境标识
+    "app-key": "android64",
+    "env": "prod",
     "referer": "https://www.bilibili.com",
     "cookie": COOKIE_STR
 }
@@ -43,7 +43,6 @@ BILI_HEADERS = {
 # 🖼️ 辅助引擎：真·BFS 动态图床
 # ==========================================
 async def upload_image_to_bfs(image_path: Path) -> dict:
-    # 🚨 完美对齐你的抓包 URL：upload_bfs
     url = "https://api.bilibili.com/x/dynamic/feed/draw/upload_bfs"
     data = {"biz": "draw", "category": "daily", "csrf": BILI_JCT}
     
@@ -59,7 +58,6 @@ async def upload_image_to_bfs(image_path: Path) -> dict:
                     
                 res = response.json()
                 if res.get("code") == 0:
-                    # 🚨 1:1 对齐抓包数据结构
                     return {
                         "img_width": res["data"]["image_width"],
                         "img_height": res["data"]["image_height"],
@@ -75,7 +73,7 @@ async def upload_image_to_bfs(image_path: Path) -> dict:
 # ==========================================
 # 📺 通道一：重型视频投稿
 # ==========================================
-async def upload_video_submission(video_path: Path, text_content: str):
+async def upload_video_submission(video_path: Path, text_content: str) -> tuple[bool, str]:
     cfg = settings.publishers.bilibili
     logger.info(f"   -> [执行] 开始上传视频主体 (较慢，请稍候)...")
     
@@ -107,18 +105,16 @@ async def upload_video_submission(video_path: Path, text_content: str):
         bvid = upload_result.get('bvid', '')
         if bvid:
             logger.info(f"\n🎉 [发布成功] 视频投稿已提交！链接: https://www.bilibili.com/video/{bvid}")
-            return True
+            return True, str(bvid)
     except Exception as e:
         logger.error(f"\n❌ [发布崩溃] 视频投稿失败: {e}")
-    return False
+    return False, ""
 
 # ==========================================
-# 📝 通道二：降维打击 1:1 抓包复刻版
+# 📝 通道二：降维打击图文发布
 # ==========================================
-async def publish_native_dynamic(text: str, image_paths: list = []):
+async def publish_native_dynamic(text: str, image_paths: list = []) -> tuple[bool, str]:
     cfg = settings.publishers.bilibili
-    
-    # 🚨 完美复刻抓包里的终极设备指纹 URL
     device_json = urllib.parse.quote('{"platform": "web", "device": "pc"}')
     web_json = urllib.parse.quote('{"spm_id": "333.999"}')
     url = f"https://api.bilibili.com/x/dynamic/feed/create/dyn?platform=web&csrf={BILI_JCT}&x-bili-device-req-json={device_json}&x-bili-web-req-json={web_json}"
@@ -131,45 +127,28 @@ async def publish_native_dynamic(text: str, image_paths: list = []):
         uploaded_pics = [r for r in results if r]
         logger.info(f"   -> [执行] 图床推流完成，成功 {len(uploaded_pics)} 张。")
 
-    # 🚨 严格对齐抓包数据的 JSON 结构
     dyn_req = {
-        "content": {
-            "contents": [{"raw_text": text, "type": 1, "biz_id": ""}]
-        },
+        "content": {"contents": [{"raw_text": text, "type": 1, "biz_id": ""}]},
         "scene": 2,
         "attach_card": None,
         "upload_id": f"{DEDEUSERID}_{int(time.time())}_{random.randint(1000, 9999)}",
-        "meta": {
-            "app_meta": {
-                "from": "create.dynamic.web",
-                "mobi_app": "web"
-            }
-        }
+        "meta": {"app_meta": {"from": "create.dynamic.web", "mobi_app": "web"}}
     }
     
-   # 标题挂载与防爆截断
     if cfg.title:
-        # 强制截断：规避 B 站可能存在的极其严格的隐藏字数/字节数限制 (保留前15个字符)
         safe_title = cfg.title[:15]
         dyn_req["content"]["title"] = safe_title
         
-    # 图片挂载
     if uploaded_pics:
         dyn_req["pics"] = uploaded_pics
 
-    # 🔐 传说中的真·私密键 private_pub
     if cfg.visibility == 1:
         dyn_req["option"] = {"private_pub": 1}
         
-    payload = {
-        "dyn_req": dyn_req
-    }
+    payload = {"dyn_req": dyn_req}
     
-    # 💡 调试探针：把即将发给 B 站的真实标题和长度打印出来
     _debug_title = dyn_req.get("content", {}).get("title", "")
-    logger.info(f"   -> [调试探针] 实际即将发送的标题: '{_debug_title}' | 字符数: {len(_debug_title)} | 字节数: {len(_debug_title.encode('utf-8'))}")
-    # logger.info(f"   -> [调试探针] 完整 Payload: {json.dumps(payload, ensure_ascii=False)}")
-    
+    logger.info(f"   -> [调试探针] 实际即将发送的标题: '{_debug_title}' | 字符数: {len(_debug_title)}")
     logger.info(f"   -> [执行] 正在发起 B站动态 POST 请求...")
     try:
         async with httpx.AsyncClient(headers=BILI_HEADERS) as client:
@@ -177,49 +156,89 @@ async def publish_native_dynamic(text: str, image_paths: list = []):
             
             if response.status_code != 200:
                 logger.error(f"\n❌ [发布失败] B站防火墙拦截 HTTP {response.status_code}: {response.text}")
-                return False
+                return False, ""
                 
             res = response.json()
-            logger.info(f"[B站发射井] 5/5: B站服务器响应 -> {json.dumps(res, ensure_ascii=False)}")
-            
             if res.get("code") == 0:
-                logger.info("\n🎉 [发布成功] 成了！这是你亲自抓包打通的胜利！快去看看客户端的私密动态！")
-                return True
+                dyn_id_str = res["data"]["dyn_id_str"]
+                logger.info(f"\n🎉 [发布成功] 成了！新动态 ID: {dyn_id_str}")
+                return True, dyn_id_str
             else:
                 logger.error(f"\n❌ [发布失败] B站拒绝了请求: {res.get('message')}")
     except Exception as e:
         logger.error(f"\n❌ [发布崩溃] 网络异常: {e}")
-    return False
+    return False, ""
+
+# ==========================================
+# 🔄 通道三：原生动态转发 (带评论)
+# ==========================================
+async def smart_repost(content: str, orig_dyn_id_str: str) -> tuple[bool, str]:
+    cfg = settings.publishers.bilibili
+    logger.info(f"   -> [执行] 正在发起 B站原生转发请求 (源动态ID: {orig_dyn_id_str})...")
+    
+    # 🚨 痛点修复：原生转发卡片不支持独立 title，必须优美地拼接到正文最上方
+    repost_text = content
+    if cfg.title:
+        repost_text = f"【{cfg.title}】\n\n{content}"
+    
+    device_json = urllib.parse.quote('{"platform": "web", "device": "pc"}')
+    web_json = urllib.parse.quote('{"spm_id": "333.999"}')
+    url = f"https://api.bilibili.com/x/dynamic/feed/create/dyn?platform=web&csrf={BILI_JCT}&x-bili-device-req-json={device_json}&x-bili-web-req-json={web_json}"
+    
+    dyn_req = {
+        "content": {"contents": [{"raw_text": repost_text, "type": 1, "biz_id": ""}]},
+        "scene": 4, # 🚨 核心：Scene 4 触发原生的带评论转发
+        "attach_card": None,
+        "upload_id": f"{DEDEUSERID}_{int(time.time())}_{random.randint(1000, 9999)}",
+        "meta": {"app_meta": {"from": "create.dynamic.web", "mobi_app": "web"}}
+    }
+    
+    # 🚨 痛点修复：严格移除 visibility == 1 时的 "private_pub": 1 逻辑
+    # B站转发接口强制公开，附带私密参数会导致请求直接被打回
+        
+    payload = {
+        "dyn_req": dyn_req,
+        "web_repost_src": {"dyn_id_str": orig_dyn_id_str}
+    }
+    
+    try:
+        async with httpx.AsyncClient(headers=BILI_HEADERS) as client:
+            response = await client.post(url, json=payload)
+            if response.status_code != 200:
+                logger.error(f"❌ [原生转发失败] HTTP {response.status_code}: {response.text}")
+                return False, ""
+            
+            res = response.json()
+            if res.get("code") == 0:
+                dyn_id_str = res["data"]["dyn_id_str"]
+                logger.info(f"🎉 [原生转发成功] 新转发动态 ID: {dyn_id_str}")
+                return True, dyn_id_str
+            else:
+                logger.error(f"❌ [原生转发失败] B站返回: {res}")
+                return False, ""
+    except Exception as e:
+        logger.error(f"❌ [原生转发异常] {e}")
+        return False, ""
 
 # ==========================================
 # 🚦 智能分发总路由
 # ==========================================
-async def smart_publish(text_content: str, media_files: list, video_type: str = "none"):
+async def smart_publish(text_content: str, media_files: list, video_type: str = "none") -> tuple[bool, str]:
     print("\n" + "="*50)
     logger.info(f"[B站发射井] 1/5: 开始读取 Config 载荷指令...")
-    cfg = settings.publishers.bilibili
     
     logger.info(f"\n[B站发射井] 2/5: 正在甄别本地素材文件...")
     videos = [Path(p) for p in media_files if str(p).lower().endswith(('.mp4', '.mov'))]
     images = [Path(p) for p in media_files if str(p).lower().endswith(('.jpg', '.jpeg', '.png'))]
     logger.info(f"   -> 找到 {len(videos)} 个视频文件，{len(images)} 张图片。")
     
-    logger.info(f"\n[B站发射井] 3/5: 系统总闸与规则匹配校验...")
     valid = await credential.check_valid()
     if not valid:
         logger.error("   ❌ [拦截] B 站 Cookies 已失效，凭证被打回！请重新抓取。")
-        return False
+        return False, ""
 
     logger.info(f"\n[B站发射井] 4/5: 智能路由投递...")
     if videos:
         return await upload_video_submission(videos[0], text_content)
     else:
         return await publish_native_dynamic(text_content, images)
-
-if __name__ == "__main__":
-    async def run_test():
-        test_text = "终于要成功了吧！！"
-        # ⚠️ 请确保下面的路径里有一张真实的图片
-        test_files = ["/Users/tgmesmer/GloBot/test_image.jpg"]
-        await smart_publish(test_text, test_files, video_type="none")
-    asyncio.run(run_test())
