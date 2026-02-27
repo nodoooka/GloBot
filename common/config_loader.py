@@ -49,6 +49,8 @@ class MediaEngineConfig(BaseModel):
 class SystemConfig(BaseModel):
     max_ram_percent: float
     max_temp_celsius: float
+    # 👈 新增：注册媒体保留天数，并限制最小值不能低于 0.5 天 (12小时)
+    media_retention_days: float = Field(default=2.0, ge=0.5, description="媒体文件最大保留天数")
 
 class BilibiliPublisherConfig(BaseModel):
     visibility: int = Field(default=1, description="0为公开, 1为仅自己可见")

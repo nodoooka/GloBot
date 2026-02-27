@@ -47,6 +47,36 @@ def save_dyn_map(dyn_map):
     with open(DYN_MAP_FILE, "w", encoding="utf-8") as f:
         json.dump(dyn_map, f, ensure_ascii=False, indent=2)
 
+# ==========================================
+# 🧹 新增：自动化媒体垃圾回收机制
+# ==========================================
+def cleanup_old_media(retention_days=2.0):
+    """定期清理过期的原始媒体文件，防止硬盘爆炸"""
+    media_dir = DATA_DIR / "media"
+    if not media_dir.exists(): return
+    
+    current_time = time.time()
+    cutoff_time = current_time - (retention_days * 24 * 3600)
+    
+    deleted_files = 0
+    for file_path in media_dir.rglob('*'):
+        if file_path.is_file():
+            if file_path.stat().st_mtime < cutoff_time:
+                try:
+                    file_path.unlink()
+                    deleted_files += 1
+                except Exception as e:
+                    logger.error(f"❌ 无法删除过期文件 {file_path.name}: {e}")
+                    
+    # 顺手清理空文件夹
+    for member_dir in media_dir.iterdir():
+        if member_dir.is_dir() and not any(member_dir.iterdir()):
+            try: member_dir.rmdir()
+            except: pass
+            
+    if deleted_files > 0:
+        logger.info(f"🧹 [空间管理] 触发自动清理！已永久销毁 {deleted_files} 个超过 {retention_days} 天的陈旧媒体文件。")
+
 # 处理媒体管线的共用函数
 async def process_media_files(media_list):
     final_paths = []
@@ -88,7 +118,6 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
     for ancestor in tweet.get('quote_chain', []):
         anc_id = ancestor['id']
         
-        # 如果这个老祖宗已经发过 B 站了，直接继承它的 ID，继续往下走
         if anc_id in dyn_map:
             prev_dyn_id = dyn_map[anc_id]
             logger.info(f"   -> ♻️ 记忆寻址命中：节点 {anc_id} 已搬运过，跳过。")
@@ -96,25 +125,18 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
             
         logger.info(f"   -> ⛓️ 发现全新未搬运的祖先节点！开始穿透发布: @{ancestor['author']}")
         
-        # 1. 翻译祖先节点
         anc_translated = await translate_text(ancestor['text'])
         
-        # 2. 完美的排版组装（无视 B 站标题，直接拼装到内容顶部）
         anc_title = settings.targets.account_title_map.get(ancestor['author'], f"@{ancestor['author']}")
         dt_str = datetime.fromtimestamp(ancestor['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
         clean_raw = html.unescape(ancestor['text'])
         
         anc_content = f"【{anc_title}】\n\n{dt_str}\n\n{anc_translated}\n\n【原文】\n{clean_raw}\n\n{anc_id}\n-由GloBot驱动"
         
-        # 🛡️ 注入净化中间件
         anc_content = sanitize_for_bilibili(anc_content)
         
-        # 3. 处理祖先媒体文件
-        
-        # 3. 处理祖先媒体文件
         anc_media, anc_video_type = await process_media_files(ancestor['media'])
         
-        # 4. 发布（判断是首发还是转发套娃）
         if prev_dyn_id:
             logger.info(f"   -> 🔄 触发 B 站无限套娃机制...")
             success, new_anc_dyn_id = await smart_repost(anc_content, prev_dyn_id)
@@ -124,7 +146,6 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
             
         cleanup_media(anc_media)
         
-        # 5. 严格风控
         if success and new_anc_dyn_id:
             dyn_map[anc_id] = new_anc_dyn_id
             save_dyn_map(dyn_map)
@@ -147,10 +168,8 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
     
     final_content = f"{dt_str}\n\n{translated_text}\n\n【原文】\n{clean_raw_text}\n\n{tweet['id']}\n-由GloBot驱动"
 
-    # 🛡️ 注入净化中间件
     final_content = sanitize_for_bilibili(final_content)
 
-    # 针对首发动态的安全标题 (只有不是转发时才会用到这个字段)
     settings.publishers.bilibili.title = raw_title[:15]
     
     final_media, video_type = await process_media_files(tweet['media'])
@@ -165,17 +184,26 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
     cleanup_media(final_media)
     return success, new_dyn_id
 
-
 async def main_loop():
     logger.info("🤖 GloBot 工业流水线已启动...")
     is_first_run = not FIRST_RUN_FLAG_FILE.exists()
     history_set = load_history()
     dyn_map = load_dyn_map()
     
+    # 🌟 新增：空间清理计时器
+    last_cleanup_time = 0
+    
     if is_first_run: logger.warning("🚨 检测到首次部署！首发截断保护机制已就绪。")
     
     while True:
         try:
+            # 🌟 新增：每隔 12 小时执行一次空间大扫除，动态读取配置，读不到默认 2 天
+            if time.time() - last_cleanup_time > 12 * 3600:
+                retention = getattr(settings.system, 'media_retention_days', 2.0)
+                logger.info(f"🔎 正在执行例行磁盘空间检查... (设定保留期限: {retention} 天)")
+                cleanup_old_media(retention_days=retention)
+                last_cleanup_time = time.time()
+
             logger.info("\n📡 启动爬虫嗅探...")
             await fetch_timeline()
             
