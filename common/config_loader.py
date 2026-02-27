@@ -61,6 +61,10 @@ class BilibiliPublisherConfig(BaseModel):
     publish_text_image: bool = True
     publish_original_video: bool = False
     publish_translated_video: bool = False
+    # 👇 新增：视频投稿专属字段
+    video_copyright: int = 2
+    video_tid: int = 171
+    video_tags: str = "iLiFE!,地下偶像"
 
 class PublishersConfig(BaseModel):
     bilibili: BilibiliPublisherConfig

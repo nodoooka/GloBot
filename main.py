@@ -16,6 +16,9 @@ from Bot_Media.media_pipeline import dispatch_media
 from Bot_Publisher.bili_uploader import smart_publish, smart_repost
 from common.text_sanitizer import sanitize_for_bilibili
 
+# 🌟 新增引入视频投稿中枢
+from Bot_Publisher.bili_video_uploader import upload_video_bilibili 
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("GloBot_Main")
 
@@ -48,7 +51,7 @@ def save_dyn_map(dyn_map):
         json.dump(dyn_map, f, ensure_ascii=False, indent=2)
 
 # ==========================================
-# 🧹 新增：自动化媒体垃圾回收机制
+# 🧹 自动化媒体垃圾回收机制
 # ==========================================
 def cleanup_old_media(retention_days=2.0):
     """定期清理过期的原始媒体文件，防止硬盘爆炸"""
@@ -136,13 +139,33 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
         anc_content = sanitize_for_bilibili(anc_content)
         
         anc_media, anc_video_type = await process_media_files(ancestor['media'])
+        anc_source_url = f"https://x.com/{ancestor['author']}/status/{anc_id}"
         
         if prev_dyn_id:
             logger.info(f"   -> 🔄 触发 B 站无限套娃机制...")
             success, new_anc_dyn_id = await smart_repost(anc_content, prev_dyn_id)
         else:
-            logger.info(f"   -> 🆕 正在将推文树的最底层根节点进行首发...")
-            success, new_anc_dyn_id = await smart_publish(anc_content, anc_media, video_type=anc_video_type)
+            # 🎥 祖先节点的视频发射路由
+            has_anc_video = (anc_video_type == "translated" and settings.publishers.bilibili.publish_translated_video) or \
+                            (anc_video_type == "original" and settings.publishers.bilibili.publish_original_video)
+            
+            if has_anc_video:
+                vid_path = next((p for p in anc_media if str(p).lower().endswith('.mp4')), None)
+                if vid_path:
+                    logger.info(f"   -> 🆕 [祖先节点] 移交视频投稿中枢...")
+                    success, new_anc_dyn_id = await upload_video_bilibili(
+                        video_path=vid_path,
+                        dynamic_title=anc_title,
+                        dynamic_content=anc_content,
+                        source_url=anc_source_url,
+                        settings=settings
+                    )
+                else:
+                    logger.info(f"   -> 🆕 [祖先节点] 移交图文首发中枢 (降级处理)...")
+                    success, new_anc_dyn_id = await smart_publish(anc_content, anc_media, video_type=anc_video_type)
+            else:
+                logger.info(f"   -> 🆕 正在将推文树的最底层根节点进行首发...")
+                success, new_anc_dyn_id = await smart_publish(anc_content, anc_media, video_type=anc_video_type)
             
         cleanup_media(anc_media)
         
@@ -173,13 +196,33 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
     settings.publishers.bilibili.title = raw_title[:15]
     
     final_media, video_type = await process_media_files(tweet['media'])
+    final_source_url = f"https://x.com/{tweet['author']}/status/{tweet['id']}"
     
     if prev_dyn_id:
         logger.info(f"   -> ♻️ 触发成员转发动作...")
         success, new_dyn_id = await smart_repost(final_content, prev_dyn_id)
     else:
-        logger.info("   -> 移交首发中枢...")
-        success, new_dyn_id = await smart_publish(final_content, final_media, video_type=video_type)
+        # 🎥 叶子节点的视频发射路由
+        has_final_video = (video_type == "translated" and settings.publishers.bilibili.publish_translated_video) or \
+                          (video_type == "original" and settings.publishers.bilibili.publish_original_video)
+                          
+        if has_final_video:
+            vid_path = next((p for p in final_media if str(p).lower().endswith('.mp4')), None)
+            if vid_path:
+                logger.info("   -> 移交视频投稿中枢...")
+                success, new_dyn_id = await upload_video_bilibili(
+                    video_path=vid_path,
+                    dynamic_title=raw_title[:15],
+                    dynamic_content=final_content,
+                    source_url=final_source_url,
+                    settings=settings
+                )
+            else:
+                logger.info("   -> 移交图文首发中枢 (降级处理)...")
+                success, new_dyn_id = await smart_publish(final_content, final_media, video_type=video_type)
+        else:
+            logger.info("   -> 移交图文首发中枢...")
+            success, new_dyn_id = await smart_publish(final_content, final_media, video_type=video_type)
         
     cleanup_media(final_media)
     return success, new_dyn_id
@@ -190,14 +233,12 @@ async def main_loop():
     history_set = load_history()
     dyn_map = load_dyn_map()
     
-    # 🌟 新增：空间清理计时器
     last_cleanup_time = 0
     
     if is_first_run: logger.warning("🚨 检测到首次部署！首发截断保护机制已就绪。")
     
     while True:
         try:
-            # 🌟 新增：每隔 12 小时执行一次空间大扫除，动态读取配置，读不到默认 2 天
             if time.time() - last_cleanup_time > 12 * 3600:
                 retention = getattr(settings.system, 'media_retention_days', 2.0)
                 logger.info(f"🔎 正在执行例行磁盘空间检查... (设定保留期限: {retention} 天)")
