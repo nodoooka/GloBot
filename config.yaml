@@ -83,7 +83,17 @@ publishers:
     video_copyright: 2           # 视频稿件类型 (1: 原创, 2: 转载)
     video_tid: 130               # 投稿分区ID (171代表电子竞技/虚拟主播等)
     video_tags: "美少女,地偶,日本地偶,地下偶像,日本偶像,日本地下偶像,iLiFE!,地下偶像,Globot" # 视频专属标签，多个标签之间用逗号分隔
-
+    # --- D. 手机端一键发布预设菜单 ---
+    video_presets:
+      - name: "地下偶像区 (130)"
+        tid: 171
+        tags: "美少女,地偶,日本地偶,地下偶像,日本偶像,日本地下偶像,iLiFE!,地下偶像"
+      - name: "宅舞区 (20)"
+        tid: 20
+        tags: "美少女,地偶,日本地偶,地下偶像,日本偶像,日本地下偶像,iLiFE!,地下偶像"
+      - name: "日常 Vlog (174)"
+        tid: 174
+        tags: "美少女,地偶,日本地偶,地下偶像,日本偶像,日本地下偶像,iLiFE!,地下偶像"
 # 5. SRE 稳定性监控阈值
 system:
   max_ram_percent: 85.0           # 内存占用超过 85% 自动 Soft-Pause

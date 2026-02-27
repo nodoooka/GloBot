@@ -58,6 +58,9 @@ def extract_tweet_node(node):
     raw_screen_name = find_key(node.get('core', {}), 'screen_name')
     author_screen_name = str(raw_screen_name).lower() if raw_screen_name else ''
     
+    # 👇 新增：精准提取推特账号的真实显示名称（Display Name）
+    raw_display_name = find_key(node.get('core', {}), 'name')
+    author_display_name = str(raw_display_name) if raw_display_name else f"@{author_screen_name}"    
     # 👇 新增：精准提取底层的评论回复对象属性
     raw_reply_name = legacy.get('in_reply_to_screen_name')
     in_reply_to_screen_name = str(raw_reply_name).lower() if raw_reply_name else None
@@ -93,6 +96,7 @@ def extract_tweet_node(node):
     return {
         'id': tweet_id,
         'author': author_screen_name,
+        'author_display_name': author_display_name, # 👇 新增这一行
         'text': full_text,
         'media_files_raw': media_files,
         'timestamp': timestamp_sec,

@@ -52,6 +52,12 @@ class SystemConfig(BaseModel):
     # 👈 新增：注册媒体保留天数，并限制最小值不能低于 0.5 天 (12小时)
     media_retention_days: float = Field(default=2.0, ge=0.5, description="媒体文件最大保留天数")
 
+# 👇 1. 新增：视频分区与标签的预设模型
+class VideoPresetConfig(BaseModel):
+    name: str
+    tid: int
+    tags: str
+
 class BilibiliPublisherConfig(BaseModel):
     visibility: int = Field(default=1, description="0为公开, 1为仅自己可见")
     title: str = Field(default="", max_length=20)
@@ -61,10 +67,16 @@ class BilibiliPublisherConfig(BaseModel):
     publish_text_image: bool = True
     publish_original_video: bool = False
     publish_translated_video: bool = False
-    # 👇 新增：视频投稿专属字段
     video_copyright: int = 2
     video_tid: int = 171
     video_tags: str = "iLiFE!,地下偶像"
+    
+    # 👇 2. 新增：注入预设选项列表。默认写死了几套配置防止 yaml 没更新时报错
+    video_presets: list[VideoPresetConfig] = Field(default_factory=lambda: [
+        VideoPresetConfig(name="地下偶像区 (171)", tid=171, tags="美少女,地偶,日本地偶,地下偶像,日本偶像,日本地下偶像,iLiFE!,地下偶像,Globot"),
+        VideoPresetConfig(name="宅舞区 (20)", tid=20, tags="舞蹈,宅舞,美少女,地下偶像,iLiFE!"),
+        VideoPresetConfig(name="日常 Vlog (174)", tid=174, tags="日常,vlog,美少女,地下偶像,iLiFE!")
+    ])
 
 class PublishersConfig(BaseModel):
     bilibili: BilibiliPublisherConfig

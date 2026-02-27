@@ -228,9 +228,9 @@ async def smart_publish(text_content: str, media_files: list, video_type: str = 
     logger.info(f"[B站发射井] 1/5: 开始读取 Config 载荷指令...")
     
     logger.info(f"\n[B站发射井] 2/5: 正在甄别本地素材文件...")
-    videos = [Path(p) for p in media_files if str(p).lower().endswith(('.mp4', '.mov'))]
+    # 👇 彻底抛弃旧版视频拦截逻辑，只提取图片！不再理会遗留的 mp4
     images = [Path(p) for p in media_files if str(p).lower().endswith(('.jpg', '.jpeg', '.png'))]
-    logger.info(f"   -> 找到 {len(videos)} 个视频文件，{len(images)} 张图片。")
+    logger.info(f"   -> 找到 {len(images)} 张图片，即将走纯图文/动态发布通道。")
     
     valid = await credential.check_valid()
     if not valid:
@@ -238,7 +238,5 @@ async def smart_publish(text_content: str, media_files: list, video_type: str = 
         return False, ""
 
     logger.info(f"\n[B站发射井] 4/5: 智能路由投递...")
-    if videos:
-        return await upload_video_submission(videos[0], text_content)
-    else:
-        return await publish_native_dynamic(text_content, images)
+    # 👇 直接调用图文发布
+    return await publish_native_dynamic(text_content, images)

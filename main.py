@@ -5,6 +5,8 @@ import logging
 import asyncio
 import random
 import html
+from Bot_Master.tg_bot import start_telegram_bot, send_tg_msg, send_tg_error, GloBotState
+import traceback
 from pathlib import Path
 from datetime import datetime
 
@@ -15,6 +17,9 @@ from Bot_Media.llm_translator import translate_text
 from Bot_Media.media_pipeline import dispatch_media
 from Bot_Publisher.bili_uploader import smart_publish, smart_repost
 from common.text_sanitizer import sanitize_for_bilibili
+
+# 强制屏蔽 httpx 的底层心跳请求日志，只显示 WARNING 及以上的报错
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # 🌟 新增引入视频投稿中枢
 from Bot_Publisher.bili_video_uploader import upload_video_bilibili 
@@ -130,11 +135,21 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
         
         anc_translated = await translate_text(ancestor['text'])
         
-        anc_title = settings.targets.account_title_map.get(ancestor['author'], f"@{ancestor['author']}")
         dt_str = datetime.fromtimestamp(ancestor['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
         clean_raw = html.unescape(ancestor['text'])
         
-        anc_content = f"【{anc_title}】\n\n{dt_str}\n\n{anc_translated}\n\n【原文】\n{clean_raw}\n\n{anc_id}\n-由GloBot驱动"
+        author_handle = ancestor['author']
+        author_display = ancestor.get('author_display_name', f"@{author_handle}")
+        
+        # 👇 核心修复：拦截非成员，并强制阻断全局变量状态污染
+        if author_handle in settings.targets.account_title_map:
+            anc_title = settings.targets.account_title_map[author_handle]
+            settings.publishers.bilibili.title = anc_title[:15] # 强制覆盖为当前成员
+            anc_content = f"【{anc_title}】\n\n{dt_str}\n\n{anc_translated}\n\n【原文】\n{clean_raw}\n\n{anc_id}\n-由GloBot驱动"
+        else:
+            anc_title = ""
+            settings.publishers.bilibili.title = "" # 强制留空，消除上一个叶子节点的残留影响
+            anc_content = f"{author_display}\n\n{dt_str}\n\n{anc_translated}\n\n【原文】\n{clean_raw}\n\n{anc_id}\n-由GloBot驱动"
         
         anc_content = sanitize_for_bilibili(anc_content)
         
@@ -209,14 +224,15 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
         if has_final_video:
             vid_path = next((p for p in final_media if str(p).lower().endswith('.mp4')), None)
             if vid_path:
-                logger.info("   -> 移交视频投稿中枢...")
-                success, new_dyn_id = await upload_video_bilibili(
-                    video_path=vid_path,
-                    dynamic_title=raw_title[:15],
-                    dynamic_content=final_content,
-                    source_url=final_source_url,
-                    settings=settings
-                )
+                    logger.info(f"   -> 🆕 [祖先节点] 移交视频投稿中枢...")
+                    success, new_anc_dyn_id = await upload_video_bilibili(
+                        video_path=vid_path,
+                        # 👇 加入保护：如果 anc_title 为空，给视频动态一个默认兜底标题
+                        dynamic_title=anc_title if anc_title else f"{author_display} 的视频", 
+                        dynamic_content=anc_content,
+                        source_url=anc_source_url,
+                        settings=settings
+                    )
             else:
                 logger.info("   -> 移交图文首发中枢 (降级处理)...")
                 success, new_dyn_id = await smart_publish(final_content, final_media, video_type=video_type)
@@ -229,19 +245,24 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
 
 async def main_loop():
     logger.info("🤖 GloBot 工业流水线已启动...")
+    
+    # 👇 1. 启动 Telegram 后台协程
+    await start_telegram_bot()
+    
     is_first_run = not FIRST_RUN_FLAG_FILE.exists()
     history_set = load_history()
     dyn_map = load_dyn_map()
-    
     last_cleanup_time = 0
     
     if is_first_run: logger.warning("🚨 检测到首次部署！首发截断保护机制已就绪。")
     
     while True:
         try:
+            # 👇 2. 阀门卡口：如果 TG 下达了暂停指令，这里会无限挂起，直到恢复
+            await GloBotState.is_running.wait()
+
             if time.time() - last_cleanup_time > 12 * 3600:
                 retention = getattr(settings.system, 'media_retention_days', 2.0)
-                logger.info(f"🔎 正在执行例行磁盘空间检查... (设定保留期限: {retention} 天)")
                 cleanup_old_media(retention_days=retention)
                 last_cleanup_time = time.time()
 
@@ -250,7 +271,6 @@ async def main_loop():
             
             json_files = list(RAW_DIR.glob("*.json"))
             if not json_files:
-                logger.info("💤 未发现 JSON 矿石，休眠中...")
                 await asyncio.sleep(60)
                 continue
                 
@@ -264,49 +284,60 @@ async def main_loop():
             
             if not new_tweets:
                 sleep_time = random.randint(240, 420)
-                logger.info(f"💤 无新动态，休眠 {sleep_time} 秒...")
                 await asyncio.sleep(sleep_time)
                 continue
                 
             new_tweets.sort(key=lambda x: x['timestamp'])
             
             if is_first_run:
-                logger.warning(f"🚨 [首发保护] 检测到首次启动，爬取到 {len(new_tweets)} 条历史推文，仅保留最新一条！")
                 for t in new_tweets[:-1]: history_set.add(str(t['id']))
                 save_history(history_set)
                 new_tweets = [new_tweets[-1]]
                 FIRST_RUN_FLAG_FILE.touch()
                 is_first_run = False
-            else:
-                logger.info(f"🎯 待处理队列：{len(new_tweets)} 条动态")
 
             total = len(new_tweets)
             for i, tweet in enumerate(new_tweets):
-                tweet_id = str(tweet['id'])
-                success, new_dyn_id = await process_pipeline(tweet, dyn_map)
+                # 👇 每次发推前都检查一下阀门状态
+                await GloBotState.is_running.wait()
                 
-                if success:
-                    history_set.add(tweet_id)
-                    save_history(history_set)
-                    if new_dyn_id:
-                        dyn_map[tweet_id] = new_dyn_id
-                        save_dyn_map(dyn_map)
+                tweet_id = str(tweet['id'])
+                
+                try:
+                    success, new_dyn_id = await process_pipeline(tweet, dyn_map)
+                    
+                    if success:
+                        history_set.add(tweet_id)
+                        save_history(history_set)
+                        if new_dyn_id:
+                            dyn_map[tweet_id] = new_dyn_id
+                            save_dyn_map(dyn_map)
+                        logger.info(f"✅ 任务 {i+1}/{total} [{tweet_id}] 成功发射！")
+                        GloBotState.daily_stats['success'] += 1  # 统计成功
+                    else:
+                        logger.error(f"❌ 推文 {tweet_id} 发布失败！")
+                        GloBotState.daily_stats['failed'] += 1   # 统计失败
+                        continue
                         
-                    logger.info(f"✅ 任务 {i+1}/{total} [{tweet_id}] 成功发射！")
-                else:
-                    logger.error(f"❌ 推文 {tweet_id} 发布失败！")
-                    break
+                except Exception as e:
+                    err_trace = traceback.format_exc()
+                    logger.error(f"🔥 处理推文 {tweet_id} 时发生内部崩溃: {e}")
+                    # 👇 3. 抛出致命异常到主理人的手机上！
+                    await send_tg_error(f"处理推文 {tweet_id} 崩溃:\n{err_trace[-300:]}")
+                    GloBotState.daily_stats['failed'] += 1
+                    continue
                     
                 if i < total - 1:
-                    logger.warning("⏳ [风控规避] 单个成员任务完成，休眠 65 秒进入下一任务...")
                     await asyncio.sleep(65)
                     
             sleep_time = random.randint(240, 420)
-            logger.info(f"✅ 周期巡视完成，深度休眠 {sleep_time} 秒...")
             await asyncio.sleep(sleep_time)
             
         except Exception as e:
+            err_trace = traceback.format_exc()
             logger.error(f"🔥 总线发生未捕获异常: {e}")
+            # 👇 将总线级崩溃直接推送到 Telegram
+            await send_tg_error(f"总线挂机大崩溃:\n{err_trace[-400:]}")
             await asyncio.sleep(60)
 
 if __name__ == "__main__":
