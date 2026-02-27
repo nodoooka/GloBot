@@ -32,3 +32,4 @@ logs/
 __pycache__/
 *.pyc
 .venv/
+globot_debug_request.txt

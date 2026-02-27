@@ -18,8 +18,9 @@ from Bot_Media.media_pipeline import dispatch_media
 from Bot_Publisher.bili_uploader import smart_publish, smart_repost
 from common.text_sanitizer import sanitize_for_bilibili
 
-# 强制屏蔽 httpx 的底层心跳请求日志，只显示 WARNING 及以上的报错
+# 强制屏蔽底层的网络心跳与连接日志
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING) # 👈 新增这行
 
 # 🌟 新增引入视频投稿中枢
 from Bot_Publisher.bili_video_uploader import upload_video_bilibili 
@@ -224,15 +225,15 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
         if has_final_video:
             vid_path = next((p for p in final_media if str(p).lower().endswith('.mp4')), None)
             if vid_path:
-                    logger.info(f"   -> 🆕 [祖先节点] 移交视频投稿中枢...")
-                    success, new_anc_dyn_id = await upload_video_bilibili(
-                        video_path=vid_path,
-                        # 👇 加入保护：如果 anc_title 为空，给视频动态一个默认兜底标题
-                        dynamic_title=anc_title if anc_title else f"{author_display} 的视频", 
-                        dynamic_content=anc_content,
-                        source_url=anc_source_url,
-                        settings=settings
-                    )
+                logger.info("   -> 移交视频投稿中枢...")
+                # 👇 修复：使用第二阶段专属的 final_content 和 raw_title
+                success, new_dyn_id = await upload_video_bilibili(
+                    video_path=vid_path,
+                    dynamic_title=raw_title[:80],  # B站视频标题最长80字
+                    dynamic_content=final_content,
+                    source_url=final_source_url,
+                    settings=settings
+                )
             else:
                 logger.info("   -> 移交图文首发中枢 (降级处理)...")
                 success, new_dyn_id = await smart_publish(final_content, final_media, video_type=video_type)
@@ -271,6 +272,8 @@ async def main_loop():
             
             json_files = list(RAW_DIR.glob("*.json"))
             if not json_files:
+                # 👇 找回这行日志
+                logger.info("💤 未发现 JSON 矿石，休眠 60 秒...")
                 await asyncio.sleep(60)
                 continue
                 
@@ -284,6 +287,8 @@ async def main_loop():
             
             if not new_tweets:
                 sleep_time = random.randint(240, 420)
+                # 👇 找回这行日志
+                logger.info(f"💤 无新动态，休眠 {sleep_time} 秒...")
                 await asyncio.sleep(sleep_time)
                 continue
                 
@@ -328,9 +333,12 @@ async def main_loop():
                     continue
                     
                 if i < total - 1:
-                    await asyncio.sleep(65)
+                        logger.warning("⏳ [风控规避] 单个成员任务完成，休眠 65 秒进入下一任务...")
+                        await asyncio.sleep(65)
                     
             sleep_time = random.randint(240, 420)
+            # 👇 找回这行日志
+            logger.info(f"✅ 周期巡视完成，深度休眠 {sleep_time} 秒...")
             await asyncio.sleep(sleep_time)
             
         except Exception as e:

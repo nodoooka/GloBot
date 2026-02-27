@@ -10,6 +10,7 @@ from datetime import datetime, time, timezone, timedelta
 from telegram import Update, Bot
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup # 👈 增加了按钮库
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler # 👈 增加了 Callback 处理
+from telegram.error import NetworkError
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from common.config_loader import settings
@@ -226,6 +227,16 @@ async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     GloBotState.daily_stats = {"success": 0, "failed": 0, "videos": 0}
 
 # ==========================================
+# 🔇 全局静音异常拦截器 (防 TG 断网刷屏)
+# ==========================================
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(context.error, NetworkError):
+        # 遇到网络闪断，只打印一行黄色警告，不再抛出几百行的红色报错
+        logger.warning(f"📡 [TG中枢] 网络连接波动，正在自动重连: {context.error}")
+    else:
+        logger.error("🔥 [TG中枢] 发生未捕获异常:", exc_info=context.error)
+
+# ==========================================
 # 🧠 启动器
 # ==========================================
 async def start_telegram_bot():
@@ -258,7 +269,10 @@ async def start_telegram_bot():
     # 注册推特链接解析
     tg_app.add_handler(MessageHandler(filters.Regex(r'x\.com|twitter\.com'), handle_twitter_link))
 
-   # 注册每日定时任务：严格指定在东京时间的 22:00:00 触发
+    # 👇 新增：将我们刚才写的静音拦截器挂载到 Bot 身上
+    tg_app.add_error_handler(global_error_handler)
+
+    # 注册每日定时任务：严格指定在东京时间的 22:00:00 触发
     report_time = time(hour=22, minute=0, second=0, tzinfo=JST)
     tg_app.job_queue.run_daily(daily_report, time=report_time)
 
