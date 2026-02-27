@@ -84,8 +84,9 @@ class RAGManager:
 
         # 成员名称属于最高优先级，必须加上极其严厉的纪律警告
         if matched_members:
-            prompt_blocks.append("\n成员名字：")
-            prompt_blocks.append("如果名字后跟了たん、ちゃん、くん、さま (様)、さん、ちー等接尾辞，则要翻译为碳、酱、君、大人、亲、亲～")
+            prompt_blocks.append("\n[1] 成员名字强制拼接公式：")
+            prompt_blocks.append("如果原文名字带有接尾辞（如ちゃん、ちー等），【必须】严格按照此公式拼接：日文名 + (罗马音) + 中文接尾辞。")
+            prompt_blocks.append("【绝对禁止】省略罗马音！例如：原文如果是「まむちー」，必须无条件输出为「まむ(Koguma Mamu)亲～」，禁止自作主张优化排版！")
             prompt_blocks.extend(matched_members)
 
         if matched_songs:
