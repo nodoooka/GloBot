@@ -14,6 +14,7 @@ from Bot_Crawler.tweet_parser import parse_timeline_json
 from Bot_Media.llm_translator import translate_text
 from Bot_Media.media_pipeline import dispatch_media
 from Bot_Publisher.bili_uploader import smart_publish, smart_repost
+from common.text_sanitizer import sanitize_for_bilibili
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("GloBot_Main")
@@ -105,6 +106,11 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
         
         anc_content = f"【{anc_title}】\n\n{dt_str}\n\n{anc_translated}\n\n【原文】\n{clean_raw}\n\n{anc_id}\n-由GloBot驱动"
         
+        # 🛡️ 注入净化中间件
+        anc_content = sanitize_for_bilibili(anc_content)
+        
+        # 3. 处理祖先媒体文件
+        
         # 3. 处理祖先媒体文件
         anc_media, anc_video_type = await process_media_files(ancestor['media'])
         
@@ -140,6 +146,9 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
     clean_raw_text = html.unescape(tweet['text'])
     
     final_content = f"{dt_str}\n\n{translated_text}\n\n【原文】\n{clean_raw_text}\n\n{tweet['id']}\n-由GloBot驱动"
+
+    # 🛡️ 注入净化中间件
+    final_content = sanitize_for_bilibili(final_content)
 
     # 针对首发动态的安全标题 (只有不是转发时才会用到这个字段)
     settings.publishers.bilibili.title = raw_title[:15]
