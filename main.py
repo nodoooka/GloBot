@@ -251,7 +251,7 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
     cleanup_media(final_media)
     return success, new_dyn_id
 
-async def main_loop():
+async def pipeline_loop():
     logger.info("🤖 GloBot 工业流水线已启动...")
     
     # 👇 1. 启动 Telegram 后台协程
@@ -326,11 +326,32 @@ async def main_loop():
                             save_dyn_map(dyn_map)
                         logger.info(f"✅ 任务 {i+1}/{total} [{tweet_id}] 成功发射！")
                         GloBotState.daily_stats['success'] += 1  # 统计成功
+                        
+                        # 🌟 新增：整体流程播报 (针对图文或普通搬运)
+                        if not str(new_dyn_id).startswith("BV"):  # 视频会在专门的模块发推送，这里过滤掉以防重复
+                            await send_tg_msg(f"🎉 <b>图文搬运成功</b> [{i+1}/{total}]\n推特源: <code>{tweet_id}</code>\n成功生成 B站动态: <code>{new_dyn_id}</code>")
+
                     else:
                         logger.error(f"❌ 推文 {tweet_id} 发布失败！")
                         GloBotState.daily_stats['failed'] += 1   # 统计失败
+                        
+                        # 🌟 新增：失败总体提示
+                        await send_tg_msg(f"❌ <b>搬运受阻</b> [{i+1}/{total}]\n推特源: <code>{tweet_id}</code>\n未能成功发布，请检查终端日志排查。")
                         continue
                         
+                except RuntimeError as e: # 🚨 核心改动：加入全局安全熔断器！
+                    if "AUTH_EXPIRED" in str(e):
+                        logger.critical(f"🛑 [熔断机制] 侦测到凭证失效，强行切断流水线: {e}")
+                        GloBotState.is_running.clear() # 物理锁死总线
+                        await send_tg_error(f"🛑 <b>安全熔断机制触发！</b>\n\n检测到账号令牌失效或被拦截：\n<code>{e}</code>\n\n为防止无限重试导致死封，流水线已<b>强制物理挂起</b>。\n👉 请在终端运行 `python Bot_Publisher/bili_login.py` 重新扫码，更新凭证后发送 <code>/resume</code> 恢复运行。")
+                        break # 强制跳出这批推文的循环，进入最外层的 wait() 挂起等待
+                    else:
+                        err_trace = traceback.format_exc()
+                        logger.error(f"🔥 处理推文 {tweet_id} 时发生运行时异常: {e}")
+                        await send_tg_error(f"处理推文崩溃:\n{err_trace[-300:]}")
+                        GloBotState.daily_stats['failed'] += 1
+                        continue
+
                 except Exception as e:
                     err_trace = traceback.format_exc()
                     logger.error(f"🔥 处理推文 {tweet_id} 时发生内部崩溃: {e}")
@@ -355,6 +376,17 @@ async def main_loop():
             await send_tg_error(f"总线挂机大崩溃:\n{err_trace[-400:]}")
             await asyncio.sleep(60)
 
+async def main_master():
+    logger.info("🤖 初始化 Telegram 中枢...")
+    GloBotState.main_loop_coro = pipeline_loop
+    # 这里的 start_telegram_bot 将接管全局控制权
+    await start_telegram_bot()
+    GloBotState.crawler_task = asyncio.create_task(pipeline_loop())
+    await send_tg_msg("🟢 <b>GloBot Matrix 已上线</b>\n总线连接正常，默认流水线已自动点火。您可随时通过 <code>/kill</code> 关停。")
+    logger.info("🟢 GloBot 主控节点已就绪，正在永久挂起主线程监听指令...")
+    while True:
+        await asyncio.sleep(86400)
+
 if __name__ == "__main__":
-    try: asyncio.run(main_loop())
+    try: asyncio.run(main_master())
     except KeyboardInterrupt: logger.info("\n🛑 收到主控台切断信号，GloBot 安全停机。")

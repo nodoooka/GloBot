@@ -3,33 +3,95 @@ import asyncio
 import os
 import math
 import logging
-from Bot_Master.tg_bot import ask_video_approval, GloBotState
+import json
+from pathlib import Path
+from Bot_Master.tg_bot import ask_video_approval, GloBotState, send_tg_msg
 
 logger = logging.getLogger("GloBot_VideoUp")
 
-async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_content: str, source_url: str, settings) -> tuple[bool, str]:
-    """
-    回归大道至简：基于旧版 /add 接口的视频发布引擎，融合 TG 审批
-    """
-    # 🔒 强制从 .env 环境变量读取敏感凭证
-    sessdata = os.getenv("BILI_SESSDATA") or os.getenv("SESSDATA")
-    bili_jct = os.getenv("BILI_JCT") or os.getenv("BILI_JCT")
-    
-    if not bili_jct or not sessdata:
-        logger.error("❌ 严重错误: 无法在 .env 中找到 BILI_SESSDATA 或 BILI_JCT，拒绝执行视频上传！")
-        return False, ""
+# 指向我们刚建立的安全凭证库
+AUTH_FILE = Path(__file__).resolve().parent.parent / "auth_store" / "bili_auth.json"
 
-    cookies = {"SESSDATA": sessdata, "bili_jct": bili_jct}
+async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_content: str, source_url: str, settings, bypass_tg: bool = False) -> tuple[bool, str]:
+    """
+    真·完全体：原生极速上传 + 扫码级凭证 + TG 审批播报 + 完美旧版载荷 + 全局熔断
+    【新增 bypass_tg 参数，支持脱离 Telegram 直接全自动发车测试】
+    """
+    # ==========================================
+    # 1. 挂起管线，TG 人工审核 / 或者是测试直通
+    # ==========================================
+    if not bypass_tg:
+        logger.info("⏸️ 正在挂起管线，等待主理人从 Telegram 预览截帧并下发元数据...")
+        hitl_data = await ask_video_approval(video_path, dynamic_content)
+        
+        if not hitl_data:
+            logger.warning("🚫 主理人已在 Telegram 拒绝本次视频发布任务。")
+            await send_tg_msg("🚫 <b>已取消</b>\n该视频投递任务已被您手动取消。")
+            return False, ""
+    else:
+        logger.info("🧪 [脱机测试模式] 触发跳过指令！将不呼叫 Telegram，直接使用入参强行发车...")
+        # 伪造一份直接通过审批的数据包
+        hitl_data = {
+            'video_title': dynamic_title,
+            'video_tid': getattr(settings.publishers.bilibili, 'video_tid', 171),
+            'video_tags': getattr(settings.publishers.bilibili, 'video_tags', "GloBot,测试")
+        }
+        
+    GloBotState.daily_stats['videos'] += 1 
+
+    bili_config = settings.publishers.bilibili
+    safe_title = hitl_data.get('video_title', dynamic_title)[:80]
+    custom_tid = hitl_data.get('video_tid', getattr(bili_config, 'video_tid', 171))
+    custom_tags = hitl_data.get('video_tags', getattr(bili_config, 'video_tags', "地下偶像"))
+    safe_desc = dynamic_content[:2000]
+
+    # ==========================================
+    # 2. 读取本地扫码凭证，组装不可击破的浏览器外壳
+    # ==========================================
+    if not AUTH_FILE.exists():
+        err = "找不到 bili_auth.json，请运行扫码脚本！"
+        logger.error(f"❌ {err}")
+        if not bypass_tg: await send_tg_msg(f"⚠️ <b>凭证缺失</b>\n{err}")
+        raise RuntimeError(f"AUTH_EXPIRED: {err}")
+        
+    try:
+        with open(AUTH_FILE, "r", encoding="utf-8") as f:
+            auth_data = json.load(f)
+            
+        cookie_parts = []
+        for k, v in auth_data.items():
+            if v:
+                if k.lower() == 'sessdata': k = 'SESSDATA'
+                elif k.lower() == 'dedeuserid': k = 'DedeUserID'
+                cookie_parts.append(f"{k}={v}")
+        cookie_str = "; ".join(cookie_parts)
+        bili_jct = auth_data.get('bili_jct', '')
+    except Exception as e:
+        logger.error(f"❌ 读取凭证失败: {e}")
+        raise RuntimeError(f"AUTH_EXPIRED: 凭证解析失败: {e}")
+
     headers = {
-        'User-Agent': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
-        'Referer': "https://member.bilibili.com/"
+        'accept': '*/*',
+        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'origin': 'https://member.bilibili.com',
+        'referer': 'https://member.bilibili.com/platform/upload/video/frame',
+        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+        'sec-ch-ua': '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"macOS"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+        'cookie': cookie_str 
     }
-    
-    async with aiohttp.ClientSession(cookies=cookies, headers=headers) as session:
+
+    async with aiohttp.ClientSession(headers=headers) as session:
         total_size = os.path.getsize(video_path)
         logger.info(f"📤 [视频引擎] 准备上传视频: {os.path.basename(video_path)} (大小: {total_size/1024/1024:.2f} MB)")
 
-        # 1. preupload 获取上传节点
+        # ==========================================
+        # 3. 申请节点 (防 403 物理盾测试 + 拦截熔断)
+        # ==========================================
         pre_url = "https://member.bilibili.com/preupload"
         params = {
             'os': 'upos', 'r': 'upos', 'profile': 'ugcupos/bup', 'ssl': 0,
@@ -37,8 +99,13 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
             'name': os.path.basename(video_path), 'size': total_size,
             'upcdn': 'bda2', 'probe_version': '20221109'
         }
+        
         async with session.get(pre_url, params=params) as resp:
+            if resp.status in [401, 403]:
+                raise RuntimeError(f"AUTH_EXPIRED: 申请节点遭遇 HTTP {resp.status} 拦截，IP 或凭证已被风控！")
             ret = await resp.json()
+            if ret.get("code") == -101:
+                raise RuntimeError("AUTH_EXPIRED: Preupload 节点返回 -101 账号未登录，凭证已彻底失效。")
 
         auth = ret['auth']
         endpoint = ret['endpoint']
@@ -47,9 +114,13 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
         chunk_size = ret['chunk_size']
 
         upos_url = f"https:{endpoint}/{upos_uri.replace('upos://', '')}"
-        upos_headers = {"X-Upos-Auth": auth}
+        
+        # CDN 节点只需验证 Auth 和 UA
+        upos_headers = {"X-Upos-Auth": auth, "User-Agent": headers["user-agent"]}
 
-        # 2. 初始化上传并获取 upload_id
+        # ==========================================
+        # 4. 高并发切片物理传输
+        # ==========================================
         async with session.post(f"{upos_url}?uploads&output=json", headers=upos_headers) as resp:
             upload_id = (await resp.json())["upload_id"]
 
@@ -71,11 +142,10 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
                             r.raise_for_status()
                             parts.append({"partNumber": chunk_idx + 1, "eTag": "etag"})
                             return
-                    except Exception as e:
-                        if attempt == 2: raise e
+                    except Exception:
                         await asyncio.sleep(2)
+                raise Exception(f"切片 {chunk_idx+1} 上传彻底失败！")
 
-        # 3. 高并发切片传输
         tasks = []
         with open(video_path, 'rb') as f:
             for i in range(chunks):
@@ -84,7 +154,6 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
         logger.info(f"🚀 [视频引擎] 正在高并发传输 {chunks} 个切片...")
         await asyncio.gather(*tasks)
 
-        # 4. 合并分片
         parts.sort(key=lambda x: x["partNumber"])
         comp_params = {
             'name': os.path.basename(video_path), 'uploadId': upload_id,
@@ -96,39 +165,18 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
 
         bili_filename = upos_uri.split('/')[-1].split('.')[0]
         logger.info(f"✅ [视频引擎] 物理文件上传成功！视频特征码: {bili_filename}")
-        
-        bili_config = settings.publishers.bilibili
 
         # ==========================================
-        # 👑 引入 TG 人工审核拦截 (在发稿前挂起)
-        # ==========================================
-        logger.info("⏸️ 正在挂起管线，等待主理人从 Telegram 下发视频元数据...")
-        
-        hitl_data = await ask_video_approval(video_path, dynamic_content)
-        
-        if not hitl_data:
-            logger.warning("🚫 主理人已在 Telegram 拒绝本次视频发布任务。")
-            return False, ""
-            
-        GloBotState.daily_stats['videos'] += 1 
-
-        # 使用 TG 传回来的数据，覆盖原始数据
-        safe_title = hitl_data.get('video_title', dynamic_title)[:80]
-        custom_tid = hitl_data.get('video_tid', getattr(bili_config, 'video_tid', 171))
-        custom_tags = hitl_data.get('video_tags', getattr(bili_config, 'video_tags', "iLiFE!,地下偶像"))
-        safe_desc = dynamic_content[:2000]
-        visibility = 1 if getattr(bili_config, 'visibility', 1) == 1 else 0
-
-        # ==========================================
-        # 5. 提交视频稿件元数据 (原汁原味的旧版 /add 接口)
+        # 🎯 5. 提交元数据 (死守最完美的 /add 旧版接口)
         # ==========================================
         submit_url = f"https://member.bilibili.com/x/vu/web/add?csrf={bili_jct}"
+        visibility = 1 if getattr(bili_config, 'visibility', 1) == 1 else 0
         
         payload = {
             "copyright": getattr(bili_config, 'video_copyright', 2),
             "source": source_url if getattr(bili_config, 'video_copyright', 2) == 2 else "",
             "tid": custom_tid,
-            "cover": "",  # 依然让 B站自动抽帧
+            "cover": "",  
             "title": safe_title,
             "desc_format_id": 0,
             "desc": safe_desc,
@@ -139,13 +187,22 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
             "is_only_self": visibility
         }
         
-        logger.info("📡 [视频引擎] 正在提交稿件元数据 (极简安全版)...")
+        logger.info("📡 [视频引擎] 正在提交稿件元数据 (脱机参数版)...")
         async with session.post(submit_url, json=payload) as resp:
             result = await resp.json()
+            
+            if result.get("code") == -101:
+                raise RuntimeError("AUTH_EXPIRED: 提交稿件时返回 -101 账号未登录。")
+                
             if result.get("code") == 0:
                 bvid = result.get('data', {}).get('bvid', '')
                 logger.info(f"🎉 [视频引擎] 投稿成功！获得 BVID: {bvid}")
+                # 只在非脱机模式下给手机发通知
+                if not bypass_tg: 
+                    await send_tg_msg(f"✅ <b>视频投稿成功！</b>\n\n📌 <b>标题:</b> {safe_title}\n📺 <b>BVID:</b> <code>{bvid}</code>\n👉 您现在可以前往 B 站创作中心查看转码状态。")
                 return True, bvid
             else:
                 logger.error(f"❌ 稿件提交失败: {result}")
+                if not bypass_tg: 
+                    await send_tg_msg(f"❌ <b>视频投稿遭拒！</b>\nB站接口返回:\n<code>{result}</code>")
                 return False, ""

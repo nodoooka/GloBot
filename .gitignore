@@ -4,6 +4,7 @@
 GloBot_Data/
 temp_downloads/
 auth_store/
+bili_auth.json
 *.mp4
 *.jpg
 *.png

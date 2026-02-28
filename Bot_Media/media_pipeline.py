@@ -112,8 +112,8 @@ async def dispatch_media(source_file_path: str):
     except: pass
 
 if __name__ == "__main__":
-    test_video = "/Users/tgmesmer/GloBot/GloBot_Data/iLiFE/media/ilife_official/2025556349686583620_video.mp4"
+    test_video = "/Users/tgmesmer/Downloads/7fWtURG6HGOcJby8.mp4"
     if Path(test_video).exists():
-        test_target = "test_pipeline_dummy.mp4"
+        test_target = "noa_pipeline_dummy.mp4"
         shutil.copy2(test_video, test_target)
         asyncio.run(dispatch_media(test_target))
