@@ -18,9 +18,16 @@ from Bot_Media.media_pipeline import dispatch_media
 from Bot_Publisher.bili_uploader import smart_publish, smart_repost
 from common.text_sanitizer import sanitize_for_bilibili
 
-# 强制屏蔽底层的网络心跳与连接日志
+# ==========================================
+# 🔇 全局日志静音配置 (防刷屏)
+# ==========================================
+# 1. 抑制底层网络库的心跳与连接日志
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING) # 👈 新增这行
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# 2. 🚨 核心修复：屏蔽 Telegram 轮询器的断网报错刷屏
+# Updater 遇到断网会自动重连，强制将其日志级别提升至 CRITICAL，避免打印几百行 Error
+logging.getLogger("telegram.ext.Updater").setLevel(logging.CRITICAL)
 
 # 🌟 新增引入视频投稿中枢
 from Bot_Publisher.bili_video_uploader import upload_video_bilibili 
