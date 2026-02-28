@@ -114,14 +114,26 @@ async def parse_timeline_json(json_file_path: Path) -> list:
     target_accounts = [acc.lower() for acc in settings.targets.x_accounts]
     parsed_new_tweets = []
 
-    for tweet_node in find_tweets(data):
+    # ==========================================
+    # 🌟 微创注入：建立全局节点缓存池，支持跨层级无限追溯回复！
+    # ==========================================
+    all_raw_tweets = list(find_tweets(data))
+    all_nodes_dict = {}
+    for t_node in all_raw_tweets:
+        n_info = extract_tweet_node(t_node)
+        all_nodes_dict[n_info['id']] = n_info
+
+    for tweet_node in all_raw_tweets:
         target_info = extract_tweet_node(tweet_node)
         
         if target_info['author'] not in target_accounts: continue
         if 'retweeted_status_result' in tweet_node.get('legacy', {}): continue
             
+        quote_chain = []
+        target_info['is_reply'] = False
+
         # ==========================================
-        # 🚨 痛点修复：评论区回复的过滤与套娃
+        # 🚨 痛点修复：评论区回复的过滤与套娃 (现已支持无限向上溯源)
         # ==========================================
         reply_to_user = target_info.get('in_reply_to_screen_name')
         if reply_to_user:
@@ -129,12 +141,32 @@ async def parse_timeline_json(json_file_path: Path) -> list:
                 continue # 规则 1：彻底忽略成员对外部账号/路人粉丝的回复
             else:
                 # 规则 2：成员间互相回复，伪装成引用转发，触发 B 站套娃！
-                target_info['quoted_tweet_id'] = target_info.get('in_reply_to_status_id_str')
+                target_info['is_reply'] = True
+                curr_reply_id = target_info.get('in_reply_to_status_id_str')
+                
+                while curr_reply_id:
+                    if curr_reply_id in all_nodes_dict:
+                        anc_info = dict(all_nodes_dict[curr_reply_id]) 
+                        anc_info['is_reply'] = True
+                        anc_info['is_placeholder'] = False
+                        quote_chain.insert(0, anc_info)
+                        curr_reply_id = anc_info.get('in_reply_to_status_id_str')
+                    else:
+                        quote_chain.insert(0, {
+                            'id': curr_reply_id,
+                            'author': reply_to_user,
+                            'author_display_name': f"@{reply_to_user}",
+                            'text': "(回复溯源占位符)",
+                            'timestamp': target_info['timestamp'] - 1,
+                            'media_files_raw': [],
+                            'is_reply': True,
+                            'is_placeholder': True
+                        })
+                        break
 
         cursor.execute("SELECT 1 FROM tweets WHERE tweet_id = ?", (target_info['id'],))
         if cursor.fetchone(): continue
 
-        quote_chain = []
         curr_node = tweet_node
         while True:
             q_res = curr_node.get('quoted_status_result', {}).get('result', {})
@@ -145,6 +177,8 @@ async def parse_timeline_json(json_file_path: Path) -> list:
                 break
                 
             q_info = extract_tweet_node(q_res)
+            q_info['is_reply'] = False
+            q_info['is_placeholder'] = False
             
             # 如果是带评论转发，记录直接父节点 ID (由于引用级别往往比普通的评论展示优先级高，所以覆盖团内回复)
             if not quote_chain:
@@ -157,6 +191,10 @@ async def parse_timeline_json(json_file_path: Path) -> list:
         # 🖼️ 为链条上的每一个节点下载媒体文件并提取 ALT
         all_nodes = quote_chain + [target_info]
         for node in all_nodes:
+            if node.get('is_placeholder'):
+                node['media'] = []
+                continue
+
             member_media_dir = FACTORY_DIR / "media" / node['author']
             member_media_dir.mkdir(parents=True, exist_ok=True)
             local_media = []

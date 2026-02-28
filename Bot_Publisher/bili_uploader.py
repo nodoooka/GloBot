@@ -48,6 +48,45 @@ def get_bili_headers():
     }
 
 # ==========================================
+# 🕵️ 动态猎犬：视频 BV 号反查真实动态 ID
+# ==========================================
+async def get_dynamic_id_by_bvid(bvid: str) -> str:
+    """反查个人主页前10条动态，使用强容错的链式提取寻找对应的数字 dyn_id"""
+    auth = get_bili_auth()
+    uid = auth.get("dedeuserid", "")
+    if not uid:
+        return None
+        
+    url = f"https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid={uid}"
+    
+    try:
+        async with httpx.AsyncClient(headers=get_bili_headers()) as client:
+            response = await client.get(url)
+            if response.status_code != 200:
+                return None
+                
+            res_json = response.json()
+            if res_json.get("code") != 0:
+                return None
+                
+            data_dict = res_json.get("data") or {}
+            items = data_dict.get("items") or []
+            
+            for item in items:
+                dyn_id = item.get("id_str", "")
+                modules = item.get("modules") or {}
+                module_dynamic = modules.get("module_dynamic") or {}
+                major = module_dynamic.get("major") or {}
+                archive = major.get("archive") or {}
+                
+                if archive.get("bvid", "") == bvid:
+                    return dyn_id
+    except Exception as e:
+        logger.error(f"❌ [动态猎犬] 反查异常: {e}")
+        
+    return None
+
+# ==========================================
 # 🖼️ 辅助引擎：真·BFS 动态图床
 # ==========================================
 async def upload_image_to_bfs(image_path: Path) -> dict:

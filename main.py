@@ -15,7 +15,8 @@ from Bot_Crawler.twitter_scraper import fetch_timeline
 from Bot_Crawler.tweet_parser import parse_timeline_json
 from Bot_Media.llm_translator import translate_text
 from Bot_Media.media_pipeline import dispatch_media
-from Bot_Publisher.bili_uploader import smart_publish, smart_repost
+# 🚨 引入刚才写好的动态猎犬
+from Bot_Publisher.bili_uploader import smart_publish, smart_repost, get_dynamic_id_by_bvid
 from common.text_sanitizer import sanitize_for_bilibili
 
 # ==========================================
@@ -126,6 +127,8 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
     logger.info(f"\n" + "="*50)
     logger.info(f"🚀 开始处理推文树... 目标终点成员: @{tweet['author']}")
     
+    # 🚨 获取 ID 保留配置策略 (兜底为 0: 全保留)
+    id_retention_level = getattr(settings.publishers.bilibili, 'tweet_id_retention', 0)
     prev_dyn_id = None
     
     # ==========================================
@@ -133,10 +136,16 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
     # ==========================================
     for ancestor in tweet.get('quote_chain', []):
         anc_id = ancestor['id']
+        is_reply = ancestor.get('is_reply', False)
+        is_placeholder = ancestor.get('is_placeholder', False)
         
         if anc_id in dyn_map:
             prev_dyn_id = dyn_map[anc_id]
             logger.info(f"   -> ♻️ 记忆寻址命中：节点 {anc_id} 已搬运过，跳过。")
+            continue
+            
+        if is_placeholder:
+            logger.info(f"   -> ⚠️ 节点 {anc_id} 仅为防断链占位符且无记忆，跳过强行发布。")
             continue
             
         logger.info(f"   -> ⛓️ 发现全新未搬运的祖先节点！开始穿透发布: @{ancestor['author']}")
@@ -150,44 +159,74 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
         author_display = ancestor.get('author_display_name', f"@{author_handle}")
         
         # 👇 核心修复：拦截非成员，并强制阻断全局变量状态污染
-        if author_handle in settings.targets.account_title_map:
-            anc_title = settings.targets.account_title_map[author_handle]
-            settings.publishers.bilibili.title = anc_title[:15] # 强制覆盖为当前成员
-            anc_content = f"【{anc_title}】\n\n{dt_str}\n\n{anc_translated}\n\n【原文】\n{clean_raw}\n\n{anc_id}\n-由GloBot驱动"
+        anc_title = settings.targets.account_title_map.get(author_handle, "")
+        display_name = anc_title if anc_title else author_display
+
+        # 🚨 排版渲染分支：极简聊天气泡 vs 传统排版
+        if is_reply:
+            settings.publishers.bilibili.title = "" # 回复不加卡片独立标题
+            anc_content = f"💬【{display_name}】回复说：\n{anc_translated}\n\n(原文: {clean_raw})"
+            if id_retention_level == 0:
+                anc_content += f"\n\n{anc_id}"
         else:
-            anc_title = ""
-            settings.publishers.bilibili.title = "" # 强制留空，消除上一个叶子节点的残留影响
-            anc_content = f"{author_display}\n\n{dt_str}\n\n{anc_translated}\n\n【原文】\n{clean_raw}\n\n{anc_id}\n-由GloBot驱动"
+            settings.publishers.bilibili.title = anc_title[:15] if anc_title else ""
+            header = f"【{anc_title}】\n\n" if anc_title else f"{display_name}\n\n"
+            anc_content = f"{header}{dt_str}\n\n{anc_translated}\n\n【原文】\n{clean_raw}"
+            if id_retention_level < 3:
+                anc_content += f"\n\n{anc_id}\n-由GloBot驱动"
         
         anc_content = sanitize_for_bilibili(anc_content)
         
         anc_media, anc_video_type = await process_media_files(ancestor['media'])
         anc_source_url = f"https://x.com/{ancestor['author']}/status/{anc_id}"
         
+        has_anc_video = (anc_video_type == "translated" and settings.publishers.bilibili.publish_translated_video) or \
+                        (anc_video_type == "original" and settings.publishers.bilibili.publish_original_video)
+        vid_path = next((p for p in anc_media if str(p).lower().endswith('.mp4')), None) if has_anc_video else None
+        has_any_media = len(anc_media) > 0 # 🚨 若包含任何图/视频，绝对禁止使用转发卡片！
+        
         if prev_dyn_id:
-            logger.info(f"   -> 🔄 触发 B 站无限套娃机制...")
-            success, new_anc_dyn_id = await smart_repost(anc_content, prev_dyn_id)
-        else:
-            # 🎥 祖先节点的视频发射路由
-            has_anc_video = (anc_video_type == "translated" and settings.publishers.bilibili.publish_translated_video) or \
-                            (anc_video_type == "original" and settings.publishers.bilibili.publish_original_video)
+            real_prev_dyn_id = prev_dyn_id
             
-            if has_anc_video:
-                vid_path = next((p for p in anc_media if str(p).lower().endswith('.mp4')), None)
-                if vid_path:
-                    logger.info(f"   -> 🆕 [祖先节点] 移交视频投稿中枢...")
-                    success, new_anc_dyn_id = await upload_video_bilibili(
-                        video_path=vid_path,
-                        dynamic_title=anc_title,
-                        dynamic_content=anc_content,
-                        source_url=anc_source_url,
-                        settings=settings
-                    )
+            # 动态猎犬反查 BV 号
+            if str(prev_dyn_id).startswith("BV"):
+                resolved_id = await get_dynamic_id_by_bvid(prev_dyn_id)
+                if resolved_id:
+                    real_prev_dyn_id = resolved_id
+                    logger.info(f"   -> 🎯 [动态猎犬] 成功将 {prev_dyn_id} 反查为动态 ID: {real_prev_dyn_id}")
                 else:
-                    logger.info(f"   -> 🆕 [祖先节点] 移交图文首发中枢 (降级处理)...")
+                    logger.warning(f"   -> ⚠️ [动态猎犬] 反查 {prev_dyn_id} 失败，将被迫执行降级发布。")
+
+            # 🚨 智能降级与反查路由
+            if has_any_media or str(real_prev_dyn_id).startswith("BV"):
+                ref_link = f"https://www.bilibili.com/video/{prev_dyn_id}" if str(prev_dyn_id).startswith("BV") else f"https://t.bilibili.com/{prev_dyn_id}"
+                
+                # 优雅拼接上下文溯源链接
+                if is_reply:
+                    anc_content += f"\n\n(🔗 溯源链接: {ref_link})"
+                else:
+                    anc_content += f"\n\n🔗 溯源链接: {ref_link}"
+                    
+                if vid_path:
+                    logger.info(f"   -> 🆕 [智能降级] 含媒体/反查拦截，转为独立视频投稿 (附溯源)...")
+                    if id_retention_level >= 2:
+                        anc_content = anc_content.replace(f"\n\n{anc_id}\n-由GloBot驱动", "").replace(f"\n\n{anc_id}", "")
+                    success, new_anc_dyn_id = await upload_video_bilibili(vid_path, anc_title if anc_title else "最新搬运", anc_content, anc_source_url, settings)
+                else:
+                    logger.info(f"   -> 🆕 [智能降级] 含媒体/反查拦截，转为独立图文动态 (附溯源)...")
                     success, new_anc_dyn_id = await smart_publish(anc_content, anc_media, video_type=anc_video_type)
             else:
-                logger.info(f"   -> 🆕 正在将推文树的最底层根节点进行首发...")
+                logger.info(f"   -> 🔄 触发 B 站无限套娃机制...")
+                success, new_anc_dyn_id = await smart_repost(anc_content, real_prev_dyn_id)
+        else:
+            # 🎥 祖先节点的视频发射路由
+            if vid_path:
+                logger.info(f"   -> 🆕 [祖先节点] 移交视频投稿中枢...")
+                if id_retention_level >= 2:
+                    anc_content = anc_content.replace(f"\n\n{anc_id}\n-由GloBot驱动", "").replace(f"\n\n{anc_id}", "")
+                success, new_anc_dyn_id = await upload_video_bilibili(vid_path, anc_title if anc_title else "最新搬运", anc_content, anc_source_url, settings)
+            else:
+                logger.info(f"   -> 🆕 [祖先节点] 移交图文首发中枢 (降级处理)...")
                 success, new_anc_dyn_id = await smart_publish(anc_content, anc_media, video_type=anc_video_type)
             
         cleanup_media(anc_media)
@@ -212,40 +251,72 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
     dt_str = datetime.fromtimestamp(tweet['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
     clean_raw_text = html.unescape(tweet['text'])
     
-    final_content = f"{dt_str}\n\n{translated_text}\n\n【原文】\n{clean_raw_text}\n\n{tweet['id']}\n-由GloBot驱动"
+    author_handle = tweet['author']
+    display_name = raw_title if author_handle in settings.targets.account_title_map else tweet.get('author_display_name', f"@{author_handle}")
+    is_leaf_reply = tweet.get('is_reply', False)
+
+    if is_leaf_reply:
+        settings.publishers.bilibili.title = ""
+        final_content = f"💬【{display_name}】回复说：\n{translated_text}\n\n(原文: {clean_raw_text})"
+        if id_retention_level == 0:
+            final_content += f"\n\n{tweet['id']}"
+    else:
+        settings.publishers.bilibili.title = raw_title[:15]
+        header = f"【{raw_title}】\n\n" if author_handle in settings.targets.account_title_map else ""
+        final_content = f"{header}{dt_str}\n\n{translated_text}\n\n【原文】\n{clean_raw_text}"
+        if id_retention_level < 3:
+            final_content += f"\n\n{tweet['id']}\n-由GloBot驱动"
 
     final_content = sanitize_for_bilibili(final_content)
-
-    settings.publishers.bilibili.title = raw_title[:15]
     
     final_media, video_type = await process_media_files(tweet['media'])
     final_source_url = f"https://x.com/{tweet['author']}/status/{tweet['id']}"
     
+    has_final_video = (video_type == "translated" and settings.publishers.bilibili.publish_translated_video) or \
+                      (video_type == "original" and settings.publishers.bilibili.publish_original_video)
+    vid_path = next((p for p in final_media if str(p).lower().endswith('.mp4')), None) if has_final_video else None
+    has_any_media = len(final_media) > 0 # 🚨 任何媒体都不能进原生转发卡片
+
     if prev_dyn_id:
-        logger.info(f"   -> ♻️ 触发成员转发动作...")
-        success, new_dyn_id = await smart_repost(final_content, prev_dyn_id)
-    else:
-        # 🎥 叶子节点的视频发射路由
-        has_final_video = (video_type == "translated" and settings.publishers.bilibili.publish_translated_video) or \
-                          (video_type == "original" and settings.publishers.bilibili.publish_original_video)
-                          
-        if has_final_video:
-            vid_path = next((p for p in final_media if str(p).lower().endswith('.mp4')), None)
-            if vid_path:
-                logger.info("   -> 移交视频投稿中枢...")
-                # 👇 修复：使用第二阶段专属的 final_content 和 raw_title
-                success, new_dyn_id = await upload_video_bilibili(
-                    video_path=vid_path,
-                    dynamic_title=raw_title[:80],  # B站视频标题最长80字
-                    dynamic_content=final_content,
-                    source_url=final_source_url,
-                    settings=settings
-                )
+        real_prev_dyn_id = prev_dyn_id
+        
+        # 动态猎犬反查 BV 号
+        if str(prev_dyn_id).startswith("BV"):
+            resolved_id = await get_dynamic_id_by_bvid(prev_dyn_id)
+            if resolved_id:
+                real_prev_dyn_id = resolved_id
+                logger.info(f"   -> 🎯 [动态猎犬] 成功将 {prev_dyn_id} 反查为动态 ID: {real_prev_dyn_id}")
             else:
-                logger.info("   -> 移交图文首发中枢 (降级处理)...")
+                logger.warning(f"   -> ⚠️ [动态猎犬] 反查 {prev_dyn_id} 失败，将被迫执行降级发布。")
+
+        if has_any_media or str(real_prev_dyn_id).startswith("BV"):
+            ref_link = f"https://www.bilibili.com/video/{prev_dyn_id}" if str(prev_dyn_id).startswith("BV") else f"https://t.bilibili.com/{prev_dyn_id}"
+            
+            if is_leaf_reply:
+                final_content += f"\n\n(🔗 溯源链接: {ref_link})"
+            else:
+                final_content += f"\n\n🔗 溯源链接: {ref_link}"
+                
+            if vid_path:
+                logger.info("   -> 🆕 [智能降级] 无法跨端转发/包含视频，转为独立视频投稿 (附溯源)...")
+                if id_retention_level >= 2:
+                    final_content = final_content.replace(f"\n\n{tweet['id']}\n-由GloBot驱动", "").replace(f"\n\n{tweet['id']}", "")
+                success, new_dyn_id = await upload_video_bilibili(vid_path, raw_title[:80] if not is_leaf_reply else f"{display_name}的视频回复", final_content, final_source_url, settings)
+            else:
+                logger.info("   -> 🆕 [智能降级] 源头为视频/包含媒体，转为独立图文动态 (附视频链接)...")
                 success, new_dyn_id = await smart_publish(final_content, final_media, video_type=video_type)
         else:
-            logger.info("   -> 移交图文首发中枢...")
+            logger.info(f"   -> ♻️ 触发成员转发动作...")
+            success, new_dyn_id = await smart_repost(final_content, real_prev_dyn_id)
+    else:
+        # 🎥 叶子节点的视频发射路由
+        if vid_path:
+            logger.info("   -> 移交视频投稿中枢...")
+            if id_retention_level >= 2:
+                final_content = final_content.replace(f"\n\n{tweet['id']}\n-由GloBot驱动", "").replace(f"\n\n{tweet['id']}", "")
+            success, new_dyn_id = await upload_video_bilibili(vid_path, raw_title[:80] if not is_leaf_reply else f"{display_name}的视频回复", final_content, final_source_url, settings)
+        else:
+            logger.info("   -> 移交图文首发中枢 (降级处理)...")
             success, new_dyn_id = await smart_publish(final_content, final_media, video_type=video_type)
         
     cleanup_media(final_media)
@@ -254,7 +325,7 @@ async def process_pipeline(tweet: dict, dyn_map: dict) -> tuple[bool, str]:
 async def pipeline_loop():
     logger.info("🤖 GloBot 工业流水线已启动...")
     
-    # 👇 1. 启动 Telegram 后台协程
+    # 这里的 start_telegram_bot 将接管全局控制权
     await start_telegram_bot()
     
     is_first_run = not FIRST_RUN_FLAG_FILE.exists()
@@ -281,7 +352,15 @@ async def pipeline_loop():
             if not json_files:
                 # 👇 找回这行日志
                 logger.info("💤 未发现 JSON 矿石，休眠 60 秒...")
-                await asyncio.sleep(60)
+                GloBotState.is_sleeping = True
+                GloBotState.wake_up_event.clear()
+                try:
+                    await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=60)
+                    logger.info("⚡ 收到强制唤醒信号，提前结束休眠！")
+                except asyncio.TimeoutError:
+                    pass
+                finally:
+                    GloBotState.is_sleeping = False
                 continue
                 
             latest_json = max(json_files, key=os.path.getmtime)
@@ -296,7 +375,15 @@ async def pipeline_loop():
                 sleep_time = random.randint(240, 420)
                 # 👇 找回这行日志
                 logger.info(f"💤 无新动态，休眠 {sleep_time} 秒...")
-                await asyncio.sleep(sleep_time)
+                GloBotState.is_sleeping = True
+                GloBotState.wake_up_event.clear()
+                try:
+                    await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=sleep_time)
+                    logger.info("⚡ 收到强制唤醒信号，提前结束休眠！")
+                except asyncio.TimeoutError:
+                    pass
+                finally:
+                    GloBotState.is_sleeping = False
                 continue
                 
             new_tweets.sort(key=lambda x: x['timestamp'])
@@ -367,7 +454,15 @@ async def pipeline_loop():
             sleep_time = random.randint(240, 420)
             # 👇 找回这行日志
             logger.info(f"✅ 周期巡视完成，深度休眠 {sleep_time} 秒...")
-            await asyncio.sleep(sleep_time)
+            GloBotState.is_sleeping = True
+            GloBotState.wake_up_event.clear()
+            try:
+                await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=sleep_time)
+                logger.info("⚡ 收到强制唤醒信号，提前结束休眠！")
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                GloBotState.is_sleeping = False
             
         except Exception as e:
             err_trace = traceback.format_exc()
@@ -379,7 +474,6 @@ async def pipeline_loop():
 async def main_master():
     logger.info("🤖 初始化 Telegram 中枢...")
     GloBotState.main_loop_coro = pipeline_loop
-    # 这里的 start_telegram_bot 将接管全局控制权
     await start_telegram_bot()
     GloBotState.crawler_task = asyncio.create_task(pipeline_loop())
     await send_tg_msg("🟢 <b>GloBot Matrix 已上线</b>\n总线连接正常，默认流水线已自动点火。您可随时通过 <code>/kill</code> 关停。")

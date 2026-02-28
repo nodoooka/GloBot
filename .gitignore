@@ -34,3 +34,4 @@ __pycache__/
 *.pyc
 .venv/
 globot_debug_request.txt
+test_dynamic_hunter.py
