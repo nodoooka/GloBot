@@ -15,7 +15,7 @@ async def run_test():
     # ==========================================
     # 🧪 测试配置区
     # ==========================================
-    test_video_path = "/Users/tgmesmer/GloBot/GloBot_Data/iLiFE/ready_to_publish/test2292.mp4" 
+    test_video_path = "/Users/tgmesmer/GloBot/GloBot_Data/iLiFE/ready_to_publish/final_uth_pipeline_dummy.mp4" 
 
     if not os.path.exists(test_video_path):
         logger.error(f"❌ 找不到测试视频文件: {test_video_path}")
@@ -23,11 +23,11 @@ async def run_test():
 
     # 🚨 绝对安全防御：代码级锁定“仅自己可见”
     settings.publishers.bilibili.visibility = 1
-    settings.publishers.bilibili.video_tid = 171
+    settings.publishers.bilibili.video_tid = 137
     settings.publishers.bilibili.video_copyright = 2
 
     # 📝 这是由于开启了 bypass_tg，代码将强行使用的本地硬编码参数
-    test_title = "【中字】aisu第一次的电视剧体验"
+    test_title = "大运动会队长决定！"
     test_content = (
         "测试动态。\n\n"
         "✨ 引擎直飞 B 站。\n"

@@ -67,6 +67,7 @@ media_engine:
 # 4. 🚀 发布集群控制面板
 publishers:
   bilibili:
+    publishers.bilibili.account_id: "爱生活搬运Bot"  # 这里填入你的真实账号名称
     # 0: 保留全部推文 ID
     # 1: 仅去掉“回复”的推文 ID
     # 2: 去掉“回复”和“视频简介”的推文 ID
@@ -90,16 +91,16 @@ publishers:
     video_tags: "美少女" # 视频专属标签，多个标签之间用逗号分隔
     # --- D. 手机端一键发布预设菜单 ---
     video_presets:
-      - name: "地下偶像区 (130)"
-        tid: 171
+      - name: "音乐综合 (130)"
+        tid: 130
         tags: "美少女,地偶,日本地偶,地下偶像,日本偶像,日本地下偶像,iLiFE!"
       - name: "宅舞区 (20)"
         tid: 20
         tags: "美少女,地偶,日本地偶,地下偶像,日本偶像,日本地下偶像,iLiFE!"
-      - name: "日常 Vlog (174)"
-        tid: 174
+      - name: "明星（测试通过） (137)"
+        tid: 137
         tags: "美少女,地偶,日本地偶,地下偶像,日本偶像,日本地下偶像,iLiFE!"
-      - name: "美女 Vlog (174)"
+      - name: "Vlog (不正常)"
         tid: 174
         tags: "美少女"
 # 5. SRE 稳定性监控阈值

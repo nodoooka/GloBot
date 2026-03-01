@@ -58,10 +58,11 @@ def extract_tweet_node(node):
     raw_screen_name = find_key(node.get('core', {}), 'screen_name')
     author_screen_name = str(raw_screen_name).lower() if raw_screen_name else ''
     
-    # 👇 新增：精准提取推特账号的真实显示名称（Display Name）
+    # 精准提取推特账号的真实显示名称
     raw_display_name = find_key(node.get('core', {}), 'name')
     author_display_name = str(raw_display_name) if raw_display_name else f"@{author_screen_name}"    
-    # 👇 新增：精准提取底层的评论回复对象属性
+    
+    # 精准提取底层的评论回复对象属性
     raw_reply_name = legacy.get('in_reply_to_screen_name')
     in_reply_to_screen_name = str(raw_reply_name).lower() if raw_reply_name else None
     in_reply_to_status_id_str = legacy.get('in_reply_to_status_id_str')
@@ -79,8 +80,7 @@ def extract_tweet_node(node):
     # 1. 干掉推特自带的 t.co 短链
     full_text = re.sub(r'https?://t\.co/\w+', '', full_text).strip()
     
-    # 2. 🚨 精准外科手术：只在“评论回复”的场景下，切除推特底层强制塞入的 @账号标签！
-    # 这样就能完美保护普通推文中，偶像主动艾特别人（如摄影师、官方号）的正常交互。
+    # 2. 🚨 仅在“评论回复”场景下切除底层强制塞入的 @账号标签
     if legacy.get('in_reply_to_status_id_str'):
         full_text = re.sub(r'^(@\w+\s*)+', '', full_text).strip()
 
@@ -96,7 +96,7 @@ def extract_tweet_node(node):
     return {
         'id': tweet_id,
         'author': author_screen_name,
-        'author_display_name': author_display_name, # 👇 新增这一行
+        'author_display_name': author_display_name,
         'text': full_text,
         'media_files_raw': media_files,
         'timestamp': timestamp_sec,
@@ -114,9 +114,7 @@ async def parse_timeline_json(json_file_path: Path) -> list:
     target_accounts = [acc.lower() for acc in settings.targets.x_accounts]
     parsed_new_tweets = []
 
-    # ==========================================
     # 🌟 微创注入：建立全局节点缓存池，支持跨层级无限追溯回复！
-    # ==========================================
     all_raw_tweets = list(find_tweets(data))
     all_nodes_dict = {}
     for t_node in all_raw_tweets:
@@ -127,47 +125,69 @@ async def parse_timeline_json(json_file_path: Path) -> list:
         target_info = extract_tweet_node(tweet_node)
         
         if target_info['author'] not in target_accounts: continue
-        if 'retweeted_status_result' in tweet_node.get('legacy', {}): continue
             
         quote_chain = []
         target_info['is_reply'] = False
-
-        # ==========================================
-        # 🚨 痛点修复：评论区回复的过滤与套娃 (现已支持无限向上溯源)
-        # ==========================================
-        reply_to_user = target_info.get('in_reply_to_screen_name')
-        if reply_to_user:
-            if reply_to_user not in target_accounts:
-                continue # 规则 1：彻底忽略成员对外部账号/路人粉丝的回复
-            else:
-                # 规则 2：成员间互相回复，伪装成引用转发，触发 B 站套娃！
-                target_info['is_reply'] = True
-                curr_reply_id = target_info.get('in_reply_to_status_id_str')
-                
-                while curr_reply_id:
-                    if curr_reply_id in all_nodes_dict:
-                        anc_info = dict(all_nodes_dict[curr_reply_id]) 
-                        anc_info['is_reply'] = True
-                        anc_info['is_placeholder'] = False
-                        quote_chain.insert(0, anc_info)
-                        curr_reply_id = anc_info.get('in_reply_to_status_id_str')
-                    else:
-                        quote_chain.insert(0, {
-                            'id': curr_reply_id,
-                            'author': reply_to_user,
-                            'author_display_name': f"@{reply_to_user}",
-                            'text': "(回复溯源占位符)",
-                            'timestamp': target_info['timestamp'] - 1,
-                            'media_files_raw': [],
-                            'is_reply': True,
-                            'is_placeholder': True
-                        })
-                        break
+        target_info['is_pure_retweet'] = False
 
         cursor.execute("SELECT 1 FROM tweets WHERE tweet_id = ?", (target_info['id'],))
         if cursor.fetchone(): continue
 
         curr_node = tweet_node
+
+        # ==========================================
+        # 🚨 痛点修复 1：完美识别纯转推，自动将原推提权为祖先！
+        # ==========================================
+        if 'retweeted_status_result' in tweet_node.get('legacy', {}):
+            target_info['is_pure_retweet'] = True
+            target_info['text'] = ""
+            target_info['media_files_raw'] = []
+            
+            rt_res = tweet_node['legacy']['retweeted_status_result'].get('result', {})
+            if rt_res.get('__typename') == 'TweetWithVisibilityResults':
+                rt_res = rt_res.get('tweet', {})
+                
+            if rt_res and 'legacy' in rt_res:
+                rt_info = extract_tweet_node(rt_res)
+                rt_info['is_reply'] = False
+                rt_info['is_placeholder'] = False
+                quote_chain.insert(0, rt_info)
+                curr_node = rt_res  # 让底部的 while 循环继续去挖原推是否也带引用
+            else:
+                continue # 如果转推的原推已被删除，直接丢弃
+        else:
+            # ==========================================
+            # 🚨 痛点修复 2：评论区回复的过滤与套娃溯源
+            # ==========================================
+            reply_to_user = target_info.get('in_reply_to_screen_name')
+            if reply_to_user:
+                if reply_to_user not in target_accounts:
+                    continue # 彻底忽略对外部路人的普通回复
+                else:
+                    target_info['is_reply'] = True
+                    curr_reply_id = target_info.get('in_reply_to_status_id_str')
+                    
+                    while curr_reply_id:
+                        if curr_reply_id in all_nodes_dict:
+                            anc_info = dict(all_nodes_dict[curr_reply_id]) 
+                            anc_info['is_reply'] = True
+                            anc_info['is_placeholder'] = False
+                            quote_chain.insert(0, anc_info)
+                            curr_reply_id = anc_info.get('in_reply_to_status_id_str')
+                        else:
+                            quote_chain.insert(0, {
+                                'id': curr_reply_id,
+                                'author': reply_to_user,
+                                'author_display_name': f"@{reply_to_user}",
+                                'text': "(回复溯源占位符)",
+                                'timestamp': target_info['timestamp'] - 1,
+                                'media_files_raw': [],
+                                'is_reply': True,
+                                'is_placeholder': True
+                            })
+                            break
+
+        # 向上深挖可能存在的多层引用嵌套
         while True:
             q_res = curr_node.get('quoted_status_result', {}).get('result', {})
             if q_res.get('__typename') == 'TweetWithVisibilityResults':
@@ -180,18 +200,17 @@ async def parse_timeline_json(json_file_path: Path) -> list:
             q_info['is_reply'] = False
             q_info['is_placeholder'] = False
             
-            # 如果是带评论转发，记录直接父节点 ID (由于引用级别往往比普通的评论展示优先级高，所以覆盖团内回复)
-            if not quote_chain:
+            if not quote_chain and not target_info['is_pure_retweet']:
                 target_info['quoted_tweet_id'] = q_info['id']
                 target_info['quoted_text'] = q_info['text']
                 
             quote_chain.insert(0, q_info)
             curr_node = q_res
 
-        # 🖼️ 为链条上的每一个节点下载媒体文件并提取 ALT
+        # 🖼️ 为链条上的每一个真实节点下载媒体文件
         all_nodes = quote_chain + [target_info]
         for node in all_nodes:
-            if node.get('is_placeholder'):
+            if node.get('is_placeholder') or node.get('is_pure_retweet'):
                 node['media'] = []
                 continue
 

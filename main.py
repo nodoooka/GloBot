@@ -115,9 +115,9 @@ def cleanup_media(media_paths):
             except: pass
 
 # ==========================================
-# 🧩 智能防扁平化排版引擎 (双轨兜底制)
+# 🧩 智能防扁平化排版引擎 (穿透隐藏级别 + 双轨兜底制)
 # ==========================================
-def build_repost_context(prev_tw_id, dyn_map, settings_obj):
+def build_repost_context(prev_tw_id, dyn_map, settings_obj, id_retention_level):
     if not prev_tw_id or prev_tw_id not in dyn_map:
         return ""
         
@@ -134,17 +134,21 @@ def build_repost_context(prev_tw_id, dyn_map, settings_obj):
     
     # 1. 户口本检索兜底双轨裁决
     p_name = settings_obj.targets.account_title_map.get(p_handle, p_disp)
-    # 2. 提取搬运号ID (可通过 config.yaml 下的 publishers.bilibili.account_id 配置)
+    
+    # 2. 提取搬运号ID
     my_account = getattr(settings_obj.publishers.bilibili, 'account_id', 'GloBot搬运')
     
     if p_is_reply:
-        # 单行极致压缩形态
+        # 单行极致压缩形态 (为了美观，不带推文尾巴)
         c_trans = p_trans.replace('\n', ' ')
         c_raw = p_raw.replace('\n', ' ')
         return f"\n//@{my_account}: 💬{p_name}回复说： {c_trans} 【原文】 {c_raw}"
     else:
-        # 1:1 多行还原形态
-        return f"\n//@{my_account}: {p_name}\n\n{p_dt}\n\n{p_trans}\n\n【原文】\n{p_raw}"
+        # 1:1 多行还原形态 (严格穿透保留原推文的小尾巴)
+        retention_str = ""
+        if id_retention_level < 3:
+            retention_str = f"\n\n{prev_tw_id}\n-由GloBot驱动"
+        return f"\n//@{my_account}: {p_name}\n\n{p_dt}\n\n{p_trans}\n\n【原文】\n{p_raw}{retention_str}"
 
 async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict) -> tuple[bool, str]:
     logger.info(f"\n" + "="*50)
@@ -190,14 +194,14 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
         author_display = ancestor.get('author_display_name', f"@{author_handle}")
         display_name = settings.targets.account_title_map.get(author_handle, author_display)
         
-        # 🚨 终极排版渲染：切除一切正文方括号和多余标题！
+        # 🚨 终极排版渲染：移除了标题强制截断，保留完整名字！
         if is_reply:
             settings.publishers.bilibili.title = "" 
             anc_content = f"💬{display_name}回复说：\n{anc_translated}\n\n(原文: {clean_raw})"
             if id_retention_level == 0:
                 anc_content += f"\n\n{anc_id}"
         else:
-            settings.publishers.bilibili.title = display_name[:15]
+            settings.publishers.bilibili.title = display_name
             anc_content = f"{dt_str}\n\n{anc_translated}\n\n【原文】\n{clean_raw}"
             if id_retention_level < 3:
                 anc_content += f"\n\n{anc_id}\n-由GloBot驱动"
@@ -224,8 +228,8 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
                 else:
                     logger.warning(f"   -> ⚠️ [动态猎犬] 反查 {prev_dyn_id} 失败，将被迫执行降级发布。")
 
-            # 👇 注入点：全息溯源文本拼接 (完美避开 B站吞卡片)
-            context_suffix = build_repost_context(prev_tw_id, dyn_map, settings)
+            # 👇 注入点：全息溯源文本拼接
+            context_suffix = build_repost_context(prev_tw_id, dyn_map, settings, id_retention_level)
             anc_content += context_suffix
 
             if has_any_media or str(real_prev_dyn_id).startswith("BV"):
@@ -284,38 +288,56 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
     logger.info(f"   -> 👑 链路穿透完成，开始处理最终成员点评！")
     
     tw_id = str(tweet['id'])
-    translated_text = preprocessing_cache[tw_id]['translated_text']
-    
-    dt_str = datetime.fromtimestamp(tweet['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
-    clean_raw_text = html.unescape(tweet['text'])
+    is_pure_retweet = tweet.get('is_pure_retweet', False)
     
     author_handle = tweet['author']
     display_name = settings.targets.account_title_map.get(author_handle, tweet.get('author_display_name', f"@{author_handle}"))
-    
+    dt_str = datetime.fromtimestamp(tweet['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
     is_leaf_reply = tweet.get('is_reply', False)
     
-    # 🚨 终极排版渲染：切除所有正文多余方括号和重复标题
-    if is_leaf_reply:
+    if is_pure_retweet:
+        # ⚡ 触发纯转推专用旁路
         settings.publishers.bilibili.title = ""
-        final_content = f"💬{display_name}回复说：\n{translated_text}\n\n(原文: {clean_raw_text})"
-        if id_retention_level == 0:
-            final_content += f"\n\n{tw_id}"
-    else:
-        settings.publishers.bilibili.title = display_name[:15]
-        final_content = f"{dt_str}\n\n{translated_text}\n\n【原文】\n{clean_raw_text}"
+        final_content = f"{display_name} 转发\n{dt_str}"
         if id_retention_level < 3:
-            final_content += f"\n\n{tw_id}\n-由GloBot驱动"
+            final_content += f"\n{tw_id}\n-由GloBot驱动"
+            
+        final_content = sanitize_for_bilibili(final_content)
+        
+        final_media = []
+        video_type = "none"
+        has_any_media = False
+        vid_path = None
+        
+        translated_text = ""
+        clean_raw_text = ""
+    else:
+        # 正常推文渲染
+        translated_text = preprocessing_cache[tw_id]['translated_text']
+        clean_raw_text = html.unescape(tweet['text'])
+        
+        # 🚨 终极排版渲染：移除了标题强制截断，保留完整名字！
+        if is_leaf_reply:
+            settings.publishers.bilibili.title = ""
+            final_content = f"💬{display_name}回复说：\n{translated_text}\n\n(原文: {clean_raw_text})"
+            if id_retention_level == 0:
+                final_content += f"\n\n{tw_id}"
+        else:
+            settings.publishers.bilibili.title = display_name
+            final_content = f"{dt_str}\n\n{translated_text}\n\n【原文】\n{clean_raw_text}"
+            if id_retention_level < 3:
+                final_content += f"\n\n{tw_id}\n-由GloBot驱动"
 
-    final_content = sanitize_for_bilibili(final_content)
-    
-    final_media = preprocessing_cache[tw_id]['final_media']
-    video_type = preprocessing_cache[tw_id]['video_type']
+        final_content = sanitize_for_bilibili(final_content)
+        
+        final_media = preprocessing_cache[tw_id]['final_media']
+        video_type = preprocessing_cache[tw_id]['video_type']
+        has_final_video = (video_type == "translated" and settings.publishers.bilibili.publish_translated_video) or \
+                          (video_type == "original" and settings.publishers.bilibili.publish_original_video)
+        vid_path = next((p for p in final_media if str(p).lower().endswith('.mp4')), None) if has_final_video else None
+        has_any_media = len(final_media) > 0 
+
     final_source_url = f"https://x.com/{tweet['author']}/status/{tw_id}"
-    
-    has_final_video = (video_type == "translated" and settings.publishers.bilibili.publish_translated_video) or \
-                      (video_type == "original" and settings.publishers.bilibili.publish_original_video)
-    vid_path = next((p for p in final_media if str(p).lower().endswith('.mp4')), None) if has_final_video else None
-    has_any_media = len(final_media) > 0 
 
     if prev_dyn_id:
         real_prev_dyn_id = prev_dyn_id
@@ -328,8 +350,8 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
             else:
                 logger.warning(f"   -> ⚠️ [动态猎犬] 反查 {prev_dyn_id} 失败，将被迫执行降级发布。")
 
-        # 👇 注入点：全息溯源文本拼接 (完美避开 B站吞卡片)
-        context_suffix = build_repost_context(prev_tw_id, dyn_map, settings)
+        # 👇 注入点：全息溯源文本拼接
+        context_suffix = build_repost_context(prev_tw_id, dyn_map, settings, id_retention_level)
         final_content += context_suffix
 
         if has_any_media or str(real_prev_dyn_id).startswith("BV"):
@@ -445,10 +467,11 @@ async def pipeline_loop():
                     if not anc.get('is_placeholder') and anc_id not in dyn_map and anc_id not in unique_nodes:
                         unique_nodes[anc_id] = anc
                 
-                # 🚨 核心修复：叶子节点必须进缓存池！无论是否在 dyn_map 里。
                 tw_id = str(tweet['id'])
-                if tw_id not in unique_nodes:
-                    unique_nodes[tw_id] = tweet
+                # 🚨 核心阻断：如果是纯转推，绝对不要扔进预处理池，省流防封！
+                if not tweet.get('is_pure_retweet'):
+                    if tw_id not in unique_nodes:
+                        unique_nodes[tw_id] = tweet
 
             preprocessing_cache = {}
             if unique_nodes:
@@ -492,14 +515,18 @@ async def pipeline_loop():
                         if new_dyn_id:
                             # 📦 第二阶段存储：将叶子节点写入双轨字典
                             dt_str = datetime.fromtimestamp(tweet['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
+                            
+                            t_trans = "" if tweet.get('is_pure_retweet') else preprocessing_cache[tweet_id]['translated_text']
+                            t_raw = "" if tweet.get('is_pure_retweet') else html.unescape(tweet['text'])
+                            
                             dyn_map[tweet_id] = {
                                 "dyn_id": new_dyn_id,
                                 "author_handle": tweet['author'],
                                 "author_display_name": tweet.get('author_display_name', f"@{tweet['author']}"),
                                 "is_reply": tweet.get('is_reply', False),
                                 "dt_str": dt_str,
-                                "translated_text": preprocessing_cache[tweet_id]['translated_text'],
-                                "raw_text": html.unescape(tweet['text'])
+                                "translated_text": t_trans,
+                                "raw_text": t_raw
                             }
                             save_dyn_map(dyn_map)
                         logger.info(f"✅ 任务 {i+1}/{total} [{tweet_id}] 成功发射！")

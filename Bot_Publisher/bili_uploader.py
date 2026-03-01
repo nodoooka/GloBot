@@ -123,11 +123,6 @@ async def upload_image_to_bfs(image_path: Path) -> dict:
     return None
 
 # ==========================================
-# 📺 通道一：重型视频投稿 (已弃用，交由专职引擎)
-# ==========================================
-# 保留你的原始结构...
-
-# ==========================================
 # 📝 通道二：降维打击图文发布
 # ==========================================
 async def publish_native_dynamic(text: str, image_paths: list = []) -> tuple[bool, str]:
@@ -154,7 +149,8 @@ async def publish_native_dynamic(text: str, image_paths: list = []) -> tuple[boo
     }
     
     if cfg.title:
-        safe_title = cfg.title[:15]
+        # 🚨 保护 API：原生图文标题强制安全截断，防止触发 HTTP 400 报错
+        safe_title = cfg.title[:20]
         dyn_req["content"]["title"] = safe_title
         
     if uploaded_pics:
@@ -199,10 +195,10 @@ async def smart_repost(content: str, orig_dyn_id_str: str) -> tuple[bool, str]:
     auth = get_bili_auth()
     logger.info(f"   -> [执行] 正在发起 B站原生转发请求 (源动态ID: {orig_dyn_id_str})...")
     
-    # 🚨 痛点修复：原生转发卡片不支持独立 title，必须优美地拼接到正文最上方
     repost_text = content
     if cfg.title:
-        repost_text = f"【{cfg.title}】\n\n{content}"
+        # 🚨 痛点修复：利用纯文本无字数限制的优势释放完整长名字，且剥离外层的方括号！
+        repost_text = f"{cfg.title}\n\n{content}"
     
     device_json = urllib.parse.quote('{"platform": "web", "device": "pc"}')
     web_json = urllib.parse.quote('{"spm_id": "333.999"}')
@@ -216,7 +212,6 @@ async def smart_repost(content: str, orig_dyn_id_str: str) -> tuple[bool, str]:
         "meta": {"app_meta": {"from": "create.dynamic.web", "mobi_app": "web"}}
     }
     
-    # 🚨 痛点修复：严格移除 visibility == 1 时的 "private_pub": 1 逻辑
     payload = {
         "dyn_req": dyn_req,
         "web_repost_src": {"dyn_id_str": orig_dyn_id_str}
@@ -253,10 +248,8 @@ async def smart_publish(text_content: str, media_files: list, video_type: str = 
     logger.info(f"[B站发射井] 1/5: 开始读取 Config 载荷指令...")
     
     logger.info(f"\n[B站发射井] 2/5: 正在甄别本地素材文件...")
-    # 👇 彻底抛弃旧版视频拦截逻辑，只提取图片！不再理会遗留的 mp4
     images = [Path(p) for p in media_files if str(p).lower().endswith(('.jpg', '.jpeg', '.png'))]
     logger.info(f"   -> 找到 {len(images)} 张图片，即将走纯图文/动态发布通道。")
     
-    # 凭证校验现在由各个方法的 AUTH_EXPIRED 统一拦截抛出
     logger.info(f"\n[B站发射井] 4/5: 智能路由投递...")
     return await publish_native_dynamic(text_content, images)
