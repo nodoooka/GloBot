@@ -10,7 +10,8 @@ import traceback
 from pathlib import Path
 from datetime import datetime
 
-from common.config_loader import settings
+# 👇 安全读取全局配置与被隔离的隐私账号名
+from common.config_loader import settings, BILI_ACCOUNT_NAME
 from Bot_Crawler.twitter_scraper import fetch_timeline
 from Bot_Crawler.tweet_parser import parse_timeline_json
 from Bot_Media.llm_translator import translate_text
@@ -62,7 +63,6 @@ def save_dyn_map(dyn_map):
 # 🧹 自动化媒体垃圾回收机制
 # ==========================================
 def cleanup_old_media(retention_days=2.0):
-    """定期清理过期的原始媒体文件，防止硬盘爆炸"""
     media_dir = DATA_DIR / "media"
     if not media_dir.exists(): return
     
@@ -115,7 +115,7 @@ def cleanup_media(media_paths):
             except: pass
 
 # ==========================================
-# 🧩 智能防扁平化排版引擎 (穿透隐藏级别 + 双轨兜底制)
+# 🧩 智能防扁平化排版引擎 (智能刹车 + 双轨兜底制)
 # ==========================================
 def build_repost_context(prev_tw_id, dyn_map, settings_obj, id_retention_level):
     if not prev_tw_id or prev_tw_id not in dyn_map:
@@ -123,7 +123,12 @@ def build_repost_context(prev_tw_id, dyn_map, settings_obj, id_retention_level):
         
     prev_info = dyn_map[prev_tw_id]
     if not isinstance(prev_info, dict):
-        return "" # 兼容你的老版本纯字符串格式
+        return "" # 兼容老版本纯字符串格式
+        
+    # 🚨 精准刹车：如果是原创动态（带图/视频），B站原生转发卡片会完美显示内容，拒绝画蛇添足！
+    p_mode = prev_info.get("publish_mode", "repost")
+    if p_mode == "original":
+        return ""
         
     p_handle = prev_info.get("author_handle", "")
     p_disp = prev_info.get("author_display_name", p_handle)
@@ -135,11 +140,11 @@ def build_repost_context(prev_tw_id, dyn_map, settings_obj, id_retention_level):
     # 1. 户口本检索兜底双轨裁决
     p_name = settings_obj.targets.account_title_map.get(p_handle, p_disp)
     
-    # 2. 提取搬运号ID
-    my_account = getattr(settings_obj.publishers.bilibili, 'account_id', 'GloBot搬运')
+    # 2. 提取极其安全的隐私搬运号ID
+    my_account = BILI_ACCOUNT_NAME
     
     if p_is_reply:
-        # 单行极致压缩形态 (为了美观，不带推文尾巴)
+        # 单行极致压缩形态
         c_trans = p_trans.replace('\n', ' ')
         c_raw = p_raw.replace('\n', ' ')
         return f"\n//@{my_account}: 💬{p_name}回复说： {c_trans} 【原文】 {c_raw}"
@@ -184,7 +189,6 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
             
         logger.info(f"   -> ⛓️ 发现全新未搬运的祖先节点！开始穿透发布: @{ancestor['author']}")
         
-        # ⚡ 极速加载并发结果
         anc_translated = preprocessing_cache[anc_id]['translated_text']
         
         dt_str = datetime.fromtimestamp(ancestor['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
@@ -194,7 +198,6 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
         author_display = ancestor.get('author_display_name', f"@{author_handle}")
         display_name = settings.targets.account_title_map.get(author_handle, author_display)
         
-        # 🚨 终极排版渲染：移除了标题强制截断，保留完整名字！
         if is_reply:
             settings.publishers.bilibili.title = "" 
             anc_content = f"💬{display_name}回复说：\n{anc_translated}\n\n(原文: {clean_raw})"
@@ -217,6 +220,9 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
         vid_path = next((p for p in anc_media if str(p).lower().endswith('.mp4')), None) if has_anc_video else None
         has_any_media = len(anc_media) > 0
         
+        # 📌 标记该环的发布类型 (供下游执行精准刹车)
+        curr_publish_mode = "original"
+        
         if prev_dyn_id:
             real_prev_dyn_id = prev_dyn_id
             
@@ -233,6 +239,7 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
             anc_content += context_suffix
 
             if has_any_media or str(real_prev_dyn_id).startswith("BV"):
+                curr_publish_mode = "original"
                 ref_link = f"https://www.bilibili.com/video/{prev_dyn_id}" if str(prev_dyn_id).startswith("BV") else f"https://t.bilibili.com/{prev_dyn_id}"
                 if is_reply:
                     anc_content += f"\n\n(🔗 溯源: {ref_link})"
@@ -248,9 +255,11 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
                     logger.info(f"   -> 🆕 [智能降级] 含媒体/反查拦截，转为独立图文动态 (附溯源)...")
                     success, new_anc_dyn_id = await smart_publish(anc_content, anc_media, video_type=anc_video_type)
             else:
+                curr_publish_mode = "repost"
                 logger.info(f"   -> 🔄 触发 B 站原生纯文本转发机制...")
                 success, new_anc_dyn_id = await smart_repost(anc_content, real_prev_dyn_id)
         else:
+            curr_publish_mode = "original"
             if vid_path:
                 logger.info(f"   -> 🆕 [祖先节点] 移交视频投稿中枢...")
                 if id_retention_level >= 2:
@@ -271,7 +280,8 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
                 "is_reply": is_reply,
                 "dt_str": dt_str,
                 "translated_text": anc_translated,
-                "raw_text": clean_raw
+                "raw_text": clean_raw,
+                "publish_mode": curr_publish_mode # 🚨 记下它的状态
             }
             save_dyn_map(dyn_map)
             prev_dyn_id = new_anc_dyn_id
@@ -296,7 +306,6 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
     is_leaf_reply = tweet.get('is_reply', False)
     
     if is_pure_retweet:
-        # ⚡ 触发纯转推专用旁路
         settings.publishers.bilibili.title = ""
         final_content = f"{display_name} 转发\n{dt_str}"
         if id_retention_level < 3:
@@ -312,11 +321,9 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
         translated_text = ""
         clean_raw_text = ""
     else:
-        # 正常推文渲染
         translated_text = preprocessing_cache[tw_id]['translated_text']
         clean_raw_text = html.unescape(tweet['text'])
         
-        # 🚨 终极排版渲染：移除了标题强制截断，保留完整名字！
         if is_leaf_reply:
             settings.publishers.bilibili.title = ""
             final_content = f"💬{display_name}回复说：\n{translated_text}\n\n(原文: {clean_raw_text})"
@@ -338,6 +345,7 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
         has_any_media = len(final_media) > 0 
 
     final_source_url = f"https://x.com/{tweet['author']}/status/{tw_id}"
+    curr_publish_mode = "original"
 
     if prev_dyn_id:
         real_prev_dyn_id = prev_dyn_id
@@ -355,6 +363,7 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
         final_content += context_suffix
 
         if has_any_media or str(real_prev_dyn_id).startswith("BV"):
+            curr_publish_mode = "original"
             ref_link = f"https://www.bilibili.com/video/{prev_dyn_id}" if str(prev_dyn_id).startswith("BV") else f"https://t.bilibili.com/{prev_dyn_id}"
             
             if is_leaf_reply:
@@ -371,9 +380,11 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
                 logger.info("   -> 🆕 [智能降级] 源头为视频/包含媒体，转为独立图文动态 (附视频链接)...")
                 success, new_dyn_id = await smart_publish(final_content, final_media, video_type=video_type)
         else:
+            curr_publish_mode = "repost"
             logger.info(f"   -> ♻️ 触发成员原生纯文本转发动作...")
             success, new_dyn_id = await smart_repost(final_content, real_prev_dyn_id)
     else:
+        curr_publish_mode = "original"
         if vid_path:
             logger.info("   -> 移交视频投稿中枢...")
             if id_retention_level >= 2:
@@ -384,7 +395,7 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
             success, new_dyn_id = await smart_publish(final_content, final_media, video_type=video_type)
         
     cleanup_media(final_media)
-    return success, new_dyn_id
+    return success, new_dyn_id, curr_publish_mode
 
 
 async def pipeline_loop():
@@ -468,7 +479,6 @@ async def pipeline_loop():
                         unique_nodes[anc_id] = anc
                 
                 tw_id = str(tweet['id'])
-                # 🚨 核心阻断：如果是纯转推，绝对不要扔进预处理池，省流防封！
                 if not tweet.get('is_pure_retweet'):
                     if tw_id not in unique_nodes:
                         unique_nodes[tw_id] = tweet
@@ -494,8 +504,18 @@ async def pipeline_loop():
                         'video_type': v_type
                     }
 
-                await asyncio.gather(*(process_one(n) for n in unique_nodes.values()))
-                logger.info(f"✅ [并发车间] 所有节点内存处理完毕！总耗时极大缩短，准备进入 Stage 3 串行发射井...")
+                # 🚨 T0 级深层防护罩
+                try:
+                    await asyncio.gather(*(process_one(n) for n in unique_nodes.values()))
+                    logger.info(f"✅ [并发车间] 所有节点内存处理完毕！总耗时极大缩短，准备进入 Stage 3 串行发射井...")
+                except RuntimeError as e:
+                    if "LLM_TRANSLATION_FAILED" in str(e):
+                        logger.critical(f"🛑 [熔断机制] 侦测到大模型翻译引擎宕机，强行切断流水线: {e}")
+                        GloBotState.is_running.clear()
+                        await send_tg_error(f"🛑 <b>大模型翻译引擎发生 T0 级宕机！</b>\n\n错误溯源：\n<code>{e}</code>\n\n⚠️ <b>致命拦截触发：</b>\n为防止向 B 站发送未翻译的生肉动态，GloBot 物理主阀门已被强制关闭！所有的发布流水线已无限期挂起。\n\n👉 请检查您的 API 密钥额度或网络连通性。\n👉 确认故障排除后，请在此发送 /resume 指令，总线将自动恢复运转并重试堆积的任务。")
+                        continue  # 任务保留在 JSON，进入下一次大循环并在 wait 处死锁，绝不丢失数据
+                    else:
+                        raise e
 
             # ==========================================
             # 🌟 三段式架构：Stage 3 (极其宁静且安全的串行发包)
@@ -507,7 +527,8 @@ async def pipeline_loop():
                 tweet_id = str(tweet['id'])
                 
                 try:
-                    success, new_dyn_id = await process_pipeline(tweet, dyn_map, preprocessing_cache)
+                    # 💡 注意：process_pipeline 现在返回 3 个参数了
+                    success, new_dyn_id, leaf_publish_mode = await process_pipeline(tweet, dyn_map, preprocessing_cache)
                     
                     if success:
                         history_set.add(tweet_id)
@@ -526,7 +547,8 @@ async def pipeline_loop():
                                 "is_reply": tweet.get('is_reply', False),
                                 "dt_str": dt_str,
                                 "translated_text": t_trans,
-                                "raw_text": t_raw
+                                "raw_text": t_raw,
+                                "publish_mode": leaf_publish_mode
                             }
                             save_dyn_map(dyn_map)
                         logger.info(f"✅ 任务 {i+1}/{total} [{tweet_id}] 成功发射！")

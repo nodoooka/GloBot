@@ -164,11 +164,12 @@ def load_config() -> AppConfig:
 
 settings = load_config()
 
-# 环境变量重载
+# 环境变量重载与 PII 隔离
 MASTER_LLM_API_KEY = os.getenv("MASTER_LLM_API_KEY")
 WORKER_GLM_API_KEY = os.getenv("WORKER_GLM_API_KEY")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+BILI_ACCOUNT_NAME = os.getenv("BILI_ACCOUNT_NAME", "GloBot搬运")  # 🛡️ 账号名转移至此！
 
 if __name__ == "__main__":
     print(f"✅ 核心配置文件加载成功！当前目标团体: {settings.targets.group_name}")

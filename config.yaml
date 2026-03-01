@@ -67,7 +67,6 @@ media_engine:
 # 4. 🚀 发布集群控制面板
 publishers:
   bilibili:
-    publishers.bilibili.account_id: "爱生活搬运Bot"  # 这里填入你的真实账号名称
     # 0: 保留全部推文 ID
     # 1: 仅去掉“回复”的推文 ID
     # 2: 去掉“回复”和“视频简介”的推文 ID
