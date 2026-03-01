@@ -14,41 +14,24 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from common.config_loader import settings
 
 logger = logging.getLogger("GloBot_Telegram")
-# 强制屏蔽 httpx 的底层心跳请求日志，只显示 WARNING 及以上的报错
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
-# ==========================================
-# 🚦 全局状态与异步桥梁
-# ==========================================
 class GloBotState:
-    # 控制 main_loop 是否运行的阀门
     is_running = asyncio.Event() 
-    
-    # 视频发布的人工确认通道 (Future 对象)
     pending_video_approval = None 
-    
-    # 统计数据，用于每日简报
     daily_stats = {"success": 0, "failed": 0, "videos": 0}
-    
-    # 架构接管的核心变量
     main_loop_coro = None    
     crawler_task = None      
-    
-    # 🌟 新增：睡眠状态机与打断事件
     is_sleeping = False
     wake_up_event = asyncio.Event()
 
-GloBotState.is_running.set()  # 默认允许运行
-tg_app = None  # 全局 Telegram Application 实例
+GloBotState.is_running.set()
+tg_app = None
 
-# ==========================================
-# 📡 1. 主动推送接口 (供外部模块调用)
-# ==========================================
 async def send_tg_msg(text: str, reply_markup=None):
-    """向主理人发送消息，自动处理网络异常"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID or not tg_app: return
     try:
         await tg_app.bot.send_message(chat_id=TG_CHAT_ID, text=text, parse_mode='HTML', reply_markup=reply_markup)
@@ -56,13 +39,9 @@ async def send_tg_msg(text: str, reply_markup=None):
         logger.error(f"❌ Telegram 推送失败: {e}")
 
 async def send_tg_error(error_msg: str):
-    """发送最高级别的红警报错"""
     text = f"🚨 <b>GloBot 核心总线异常拦截</b>\n<pre>{error_msg}</pre>"
     await send_tg_msg(text)
 
-# ==========================================
-# 🛑 2. 基础指令控制：启停与状态
-# ==========================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 欢迎连接 GloBot Matrix 控制台！\n使用 /help 查看可用指令。")
 
@@ -85,11 +64,11 @@ async def cmd_kill(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ 引擎当前并未运行。")
 
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    GloBotState.is_running.clear() # 关阀门
+    GloBotState.is_running.clear()
     await update.message.reply_text("⏸️ <b>已下达停机指令。</b>\n总线将在完成当前任务后进入挂起状态，停止发稿。", parse_mode='HTML')
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    GloBotState.is_running.set() # 开阀门
+    GloBotState.is_running.set()
     await update.message.reply_text("▶️ <b>已下达恢复指令。</b>\n总线封锁已解除，流水线重新启动！", parse_mode='HTML')
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -129,6 +108,17 @@ async def handle_memory_wipe(tweet_id: str) -> tuple[bool, str]:
                 history.remove(tweet_id)
                 with open(history_file, "w", encoding="utf-8") as f:
                     json.dump(list(history), f, ensure_ascii=False, indent=2)
+                    
+        # 3. 🚨 核心修复：抹除 dyn_map 里的残余羁绊，防止强发导致 KeyError
+        dyn_map_file = Path(os.getenv("LOCAL_DATA_DIR", f"./GloBot_Data/{settings.targets.group_name}")) / "dyn_map.json"
+        if dyn_map_file.exists():
+            with open(dyn_map_file, "r", encoding="utf-8") as f:
+                dyn_map = json.load(f)
+            if tweet_id in dyn_map:
+                del dyn_map[tweet_id]
+                with open(dyn_map_file, "w", encoding="utf-8") as f:
+                    json.dump(dyn_map, f, ensure_ascii=False, indent=2)
+                    
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -138,10 +128,10 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ 用法: /reset <推文ID>")
         return
     tweet_id = context.args[0]
-    await update.message.reply_text(f"🔍 收到静默爆破指令，正在重置推文 [{tweet_id}] 的拦截记录...")
+    await update.message.reply_text(f"🔍 收到静默爆破指令，正在重置推文 [{tweet_id}] 的全部拦截记录...")
     success, err = await handle_memory_wipe(tweet_id)
     if success:
-        await update.message.reply_text(f"🎯 <b>指令已下达！</b>\n推文 <code>{tweet_id}</code> 的防重复记忆已被彻底抹除。\n总线将在下一次自然巡视时处理。", parse_mode='HTML')
+        await update.message.reply_text(f"🎯 <b>指令已下达！</b>\n推文 <code>{tweet_id}</code> 的防重复记忆已被彻底物理抹除。\n总线将在下一次自然巡视时处理。", parse_mode='HTML')
     else:
         await update.message.reply_text(f"❌ 抹除记忆失败: {err}")
 
@@ -155,16 +145,16 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ 引擎当前正在高速运转处理任务，强制唤醒指令不生效。\n请等待其进入休眠状态后再试，或使用 /reset 仅抹除记忆。")
         return
 
-    await update.message.reply_text(f"🔍 收到强制唤醒指令，正在重置推文 [{tweet_id}] ...")
+    await update.message.reply_text(f"🔍 收到强制唤醒指令，正在重置推文 [{tweet_id}] 的全部记录...")
     success, err = await handle_memory_wipe(tweet_id)
     if success:
-        GloBotState.wake_up_event.set() # 🔥 核心：发送异步事件，彻底打断睡眠进程！
+        GloBotState.wake_up_event.set() 
         await update.message.reply_text("⚡ <b>强制唤醒已触发！</b>\n流水线休眠被打断，正在火速启动新一轮抓取！", parse_mode='HTML')
     else:
         await update.message.reply_text(f"❌ 抹除记忆失败，唤醒中止: {err}")
 
 # ==========================================
-# 🎥 4. 视频发布人工介入 (一键面板升级版，含5图预览)
+# 🎥 4. 视频发布人工介入
 # ==========================================
 WAIT_TITLE, WAIT_PRESET, WAIT_CONFIRM = range(3)
 
@@ -281,11 +271,9 @@ async def video_hitl_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 # 📊 5. 每日简报任务 (严格锁定东京时间 22:00)
 # ==========================================
-# 定义东京时间 (UTC+9)
 JST = timezone(timedelta(hours=9))
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
-    # 获取当前东京时间
     now_jst = datetime.now(JST)
     
     report = (
@@ -299,16 +287,13 @@ async def daily_report(context: ContextTypes.DEFAULT_TYPE):
         f"状态: 数据已清零归档，夜间自动值守已就绪！"
     )
     await send_tg_msg(report)
-    
-    # 播报完后立刻重置统计数据，迎接下一个 24 小时周期
     GloBotState.daily_stats = {"success": 0, "failed": 0, "videos": 0}
 
 # ==========================================
-# 🔇 全局静音异常拦截器 (防 TG 断网刷屏)
+# 🔇 全局静音异常拦截器
 # ==========================================
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(context.error, NetworkError):
-        # 遇到网络闪断，只打印一行黄色警告，不再抛出几百行的红色报错
         logger.warning(f"📡 [TG中枢] 网络连接波动，正在自动重连: {context.error}")
     else:
         logger.error("🔥 [TG中枢] 发生未捕获异常:", exc_info=context.error)
@@ -324,7 +309,6 @@ async def start_telegram_bot():
 
     tg_app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
 
-    # 注册指令
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("help", cmd_start))
     tg_app.add_handler(CommandHandler("boot", cmd_boot))
@@ -332,12 +316,9 @@ async def start_telegram_bot():
     tg_app.add_handler(CommandHandler("pause", cmd_pause))
     tg_app.add_handler(CommandHandler("resume", cmd_resume))
     tg_app.add_handler(CommandHandler("status", cmd_status))
-    
-    # 🌟 注册重置与强制唤醒指令
     tg_app.add_handler(CommandHandler("reset", cmd_reset))
     tg_app.add_handler(CommandHandler("force", cmd_force))
     
-    # 注册视频 HITL 审批对话机
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & (~filters.COMMAND), video_hitl_title)],
         states={
@@ -348,11 +329,8 @@ async def start_telegram_bot():
         fallbacks=[CommandHandler('cancel', video_hitl_cancel)]
     )
     tg_app.add_handler(conv_handler)
-
-    # 👇 挂载静音拦截器
     tg_app.add_error_handler(global_error_handler)
 
-    # 注册每日定时任务
     report_time = time(hour=22, minute=0, second=0, tzinfo=JST)
     tg_app.job_queue.run_daily(daily_report, time=report_time)
 

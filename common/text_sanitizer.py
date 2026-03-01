@@ -31,7 +31,12 @@ ANTI_THROTTLING = {
 # \u0600-\u06FF : 阿拉伯文 (包含 ٛ 和 ٍ 等颜文字常用变音符)
 # \u0750-\u077F : 阿拉伯文补充
 # \u0F00-\u0FFF : 藏文 (常用于制造堆叠字符)
-DANGEROUS_UNICODE_PATTERN = r'[\u0300-\u036F\u0600-\u06FF\u0750-\u077F\u0F00-\u0FFF]+'
+# 👇 新增：日本偶像极度爱用，但必被 B 站拦截的生僻颜文字字符块
+# \u1F00-\u1FFF : 希腊扩展 (包含了 ῀ )
+# \u1800-\u18AF : 蒙古文 (包含了 ᢦ )
+# \u0E00-\u0E7F : 泰文 (常用于当做眼睛或嘴巴)
+# \u1780-\u17FF : 高棉文/柬埔寨文
+DANGEROUS_UNICODE_PATTERN = r'[\u0300-\u036F\u0600-\u06FF\u0750-\u077F\u0F00-\u0FFF\u1F00-\u1FFF\u1800-\u18AF\u0E00-\u0E7F\u1780-\u17FF]+'
 
 def sanitize_for_bilibili(text: str) -> str:
     """B 站专属终极文本净化流水线"""
