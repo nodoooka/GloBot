@@ -13,10 +13,6 @@ logger = logging.getLogger("GloBot_VideoUp")
 AUTH_FILE = Path(__file__).resolve().parent.parent / "auth_store" / "bili_auth.json"
 
 async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_content: str, source_url: str, settings, bypass_tg: bool = False) -> tuple[bool, str]:
-    """
-    真·完全体：原生极速上传 + 扫码级凭证 + TG 审批播报 + 完美旧版载荷 + 全局熔断
-    【新增 bypass_tg 参数，支持脱离 Telegram 直接全自动发车测试】
-    """
     # ==========================================
     # 1. 挂起管线，TG 人工审核 / 或者是测试直通
     # ==========================================
@@ -30,7 +26,6 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
             return False, ""
     else:
         logger.info("🧪 [脱机测试模式] 触发跳过指令！将不呼叫 Telegram，直接使用入参强行发车...")
-        # 伪造一份直接通过审批的数据包
         hitl_data = {
             'video_title': dynamic_title,
             'video_tid': getattr(settings.publishers.bilibili, 'video_tid', 171),
@@ -43,7 +38,10 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
     safe_title = hitl_data.get('video_title', dynamic_title)[:80]
     custom_tid = hitl_data.get('video_tid', getattr(bili_config, 'video_tid', 171))
     custom_tags = hitl_data.get('video_tags', getattr(bili_config, 'video_tags', "地下偶像"))
-    safe_desc = dynamic_content[:2000]
+    
+    # 🚨 终极安全裁切阀：确保无论如何都不会因为越界导致发包 JSON 失败
+    safe_desc = dynamic_content[:240]
+    safe_dynamic = dynamic_content[:220]
 
     # ==========================================
     # 2. 读取本地扫码凭证，组装不可击破的浏览器外壳
@@ -67,7 +65,6 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
         cookie_str = "; ".join(cookie_parts)
         bili_jct = auth_data.get('bili_jct', '')
     except Exception as e:
-        logger.error(f"❌ 读取凭证失败: {e}")
         raise RuntimeError(f"AUTH_EXPIRED: 凭证解析失败: {e}")
 
     headers = {
@@ -76,18 +73,12 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
         'origin': 'https://member.bilibili.com',
         'referer': 'https://member.bilibili.com/platform/upload/video/frame',
         'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
-        'sec-ch-ua': '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"macOS"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
         'cookie': cookie_str 
     }
 
     async with aiohttp.ClientSession(headers=headers) as session:
         total_size = os.path.getsize(video_path)
-        logger.info(f"📤 [视频引擎] 准备上传视频: {os.path.basename(video_path)} (大小: {total_size/1024/1024:.2f} MB)")
+        logger.info(f"📤 [视频引擎] 准备上传视频: {os.path.basename(video_path)}")
 
         # ==========================================
         # 3. 申请节点 (防 403 物理盾测试 + 拦截熔断)
@@ -102,20 +93,16 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
         
         async with session.get(pre_url, params=params) as resp:
             if resp.status in [401, 403]:
-                raise RuntimeError(f"AUTH_EXPIRED: 申请节点遭遇 HTTP {resp.status} 拦截，IP 或凭证已被风控！")
+                raise RuntimeError(f"AUTH_EXPIRED: 申请节点遭遇 HTTP {resp.status} 拦截！")
             ret = await resp.json()
             if ret.get("code") == -101:
-                raise RuntimeError("AUTH_EXPIRED: Preupload 节点返回 -101 账号未登录，凭证已彻底失效。")
+                raise RuntimeError("AUTH_EXPIRED: Preupload 返回 -101 账号未登录。")
 
         auth = ret['auth']
-        endpoint = ret['endpoint']
         upos_uri = ret['upos_uri']
         biz_id = ret['biz_id']
         chunk_size = ret['chunk_size']
-
-        upos_url = f"https:{endpoint}/{upos_uri.replace('upos://', '')}"
-        
-        # CDN 节点只需验证 Auth 和 UA
+        upos_url = f"https:{ret['endpoint']}/{upos_uri.replace('upos://', '')}"
         upos_headers = {"X-Upos-Auth": auth, "User-Agent": headers["user-agent"]}
 
         # ==========================================
@@ -164,10 +151,10 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
                 raise Exception("合并分片失败")
 
         bili_filename = upos_uri.split('/')[-1].split('.')[0]
-        logger.info(f"✅ [视频引擎] 物理文件上传成功！视频特征码: {bili_filename}")
+        logger.info(f"✅ [视频引擎] 物理文件上传成功！特征码: {bili_filename}")
 
         # ==========================================
-        # 🎯 5. 提交元数据 (死守最完美的 /add 旧版接口)
+        # 🎯 5. 提交元数据 (严格控制 desc 和 dynamic 容量)
         # ==========================================
         submit_url = f"https://member.bilibili.com/x/vu/web/add?csrf={bili_jct}"
         visibility = 1 if getattr(bili_config, 'visibility', 1) == 1 else 0
@@ -180,26 +167,23 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
             "title": safe_title,
             "desc_format_id": 0,
             "desc": safe_desc,
-            "dynamic": safe_desc,
+            "dynamic": safe_dynamic,
             "subtitle": {"open": 0, "lan": ""},
             "tag": custom_tags,
             "videos": [{"title": safe_title, "filename": bili_filename, "desc": ""}],
             "is_only_self": visibility
         }
         
-        logger.info("📡 [视频引擎] 正在提交稿件元数据 (脱机参数版)...")
+        logger.info("📡 [视频引擎] 正在提交稿件元数据 (极速降级适配版)...")
         async with session.post(submit_url, json=payload) as resp:
             result = await resp.json()
-            
             if result.get("code") == -101:
                 raise RuntimeError("AUTH_EXPIRED: 提交稿件时返回 -101 账号未登录。")
-                
             if result.get("code") == 0:
                 bvid = result.get('data', {}).get('bvid', '')
                 logger.info(f"🎉 [视频引擎] 投稿成功！获得 BVID: {bvid}")
-                # 只在非脱机模式下给手机发通知
                 if not bypass_tg: 
-                    await send_tg_msg(f"✅ <b>视频投稿成功！</b>\n\n📌 <b>标题:</b> {safe_title}\n📺 <b>BVID:</b> <code>{bvid}</code>\n👉 您现在可以前往 B 站创作中心查看转码状态。")
+                    await send_tg_msg(f"✅ <b>视频投稿成功！</b>\n\n📌 <b>标题:</b> {safe_title}\n📺 <b>BVID:</b> <code>{bvid}</code>")
                 return True, bvid
             else:
                 logger.error(f"❌ 稿件提交失败: {result}")
