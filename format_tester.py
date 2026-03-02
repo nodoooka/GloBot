@@ -6,9 +6,6 @@ import gradio as gr
 from pathlib import Path
 from dotenv import load_dotenv
 
-# ==========================================
-# ⚙️ 环境与核心依赖初始化
-# ==========================================
 sys.path.append(str(Path(__file__).resolve().parent))
 load_dotenv()
 
@@ -36,7 +33,7 @@ def fetch_local_data(c_id, p_id):
     dyn_map = load_dyn_map()
     
     c_trans, c_raw, c_handle, c_disp = "", "", "", ""
-    c_is_reply, c_is_rt = False, False
+    c_node_type = "ORIGINAL"
     c_time = "2026-03-01 12:00:00"
     
     if c_id and c_id in dyn_map:
@@ -46,12 +43,14 @@ def fetch_local_data(c_id, p_id):
             c_raw = c_info.get("raw_text", "")
             c_handle = c_info.get("author_handle", "")
             c_disp = c_info.get("author_display_name", "")
-            c_is_reply = c_info.get("is_reply", False)
+            c_node_type = c_info.get("node_type", "ORIGINAL")
             c_time = c_info.get("dt_str", "2026-03-01 12:00:00")
-            if not c_trans and not c_raw: c_is_rt = True
+            # 兼容老版数据
+            if "is_reply" in c_info and c_info["is_reply"]: c_node_type = "REPLY"
+            if not c_trans and not c_raw: c_node_type = "RETWEET"
 
     p_trans, p_raw, p_handle, p_disp = "", "", "", ""
-    p_is_reply, p_mode = False, "repost"
+    p_node_type, p_mode = "ORIGINAL", "repost"
     p_time = "2026-03-01 10:00:00"
     
     if p_id and p_id in dyn_map:
@@ -61,17 +60,19 @@ def fetch_local_data(c_id, p_id):
             p_raw = p_info.get("raw_text", "")
             p_handle = p_info.get("author_handle", "")
             p_disp = p_info.get("author_display_name", "")
-            p_is_reply = p_info.get("is_reply", False)
+            p_node_type = p_info.get("node_type", "ORIGINAL")
             p_mode = p_info.get("publish_mode", "repost")
             p_time = p_info.get("dt_str", "2026-03-01 10:00:00")
+            # 兼容老版数据
+            if "is_reply" in p_info and p_info["is_reply"]: p_node_type = "REPLY"
 
-    return (c_trans, c_raw, c_handle, c_disp, c_is_reply, c_is_rt, c_time, 
-            p_trans, p_raw, p_handle, p_disp, p_is_reply, p_mode, p_time)
+    return (c_trans, c_raw, c_handle, c_disp, c_node_type, c_time, 
+            p_trans, p_raw, p_handle, p_disp, p_node_type, p_mode, p_time)
 
 # ==========================================
 # 🚀 1:1 复制 main.py 的排版组装引擎
 # ==========================================
-def build_repost_context(p_id, p_handle, p_disp, p_is_reply, p_mode, p_dt, p_trans, p_raw, ret_level, is_video_mode):
+def build_repost_context(p_id, p_handle, p_disp, p_node_type, p_mode, p_dt, p_trans, p_raw, ret_level, is_video_mode):
     if not p_id: return ""
     if p_mode == "original": return "" 
         
@@ -80,12 +81,12 @@ def build_repost_context(p_id, p_handle, p_disp, p_is_reply, p_mode, p_dt, p_tra
     if is_video_mode:
         c_trans_p = p_trans.replace('\n', ' ')
         if len(c_trans_p) > 25: c_trans_p = c_trans_p[:25] + "..."
-        if p_is_reply:
+        if p_node_type == 'REPLY':
             return f"\n//@{BILI_ACCOUNT_NAME}: 💬{p_name}回复: {c_trans_p}"
         else:
             return f"\n//@{BILI_ACCOUNT_NAME}: {p_name}: {c_trans_p}"
     else:
-        if p_is_reply:
+        if p_node_type == 'REPLY':
             c_trans_p = p_trans.replace('\n', ' ')
             c_raw_p = p_raw.replace('\n', ' ')
             return f"\n//@{BILI_ACCOUNT_NAME}: 💬{p_name}回复说： {c_trans_p} 【原文】 {c_raw_p}"
@@ -95,8 +96,8 @@ def build_repost_context(p_id, p_handle, p_disp, p_is_reply, p_mode, p_dt, p_tra
                 retention_str = f"\n\n{p_id}\n-由GloBot驱动"
             return f"\n//@{BILI_ACCOUNT_NAME}: {p_name}\n\n{p_dt}\n\n{p_trans}\n\n【原文】\n{p_raw}{retention_str}"
 
-def build_safe_dynamic_text(c_name, c_time, c_trans, c_raw, c_id, c_is_reply, c_is_rt, ret_level, context_suffix, ref_link, limit):
-    if c_is_rt:
+def build_safe_dynamic_text(c_name, c_time, c_trans, c_raw, c_id, c_node_type, ret_level, context_suffix, ref_link, limit):
+    if c_node_type == 'RETWEET':
         text = f"{c_name} 转发\n{c_time}"
         if context_suffix: text += context_suffix
         if ref_link: text += f"\n\n🔗 溯源: {ref_link}"
@@ -104,23 +105,23 @@ def build_safe_dynamic_text(c_name, c_time, c_trans, c_raw, c_id, c_is_reply, c_
         return sanitize_for_bilibili(text[:limit])
 
     def assemble(include_tail, include_raw, truncate_trans_len=None):
-        res = f"💬{c_name}回复说：\n" if c_is_reply else f"{c_time}\n\n"
+        res = f"💬{c_name}回复说：\n" if c_node_type == 'REPLY' else f"{c_time}\n\n"
             
         if truncate_trans_len is not None: res += c_trans[:truncate_trans_len] + "..."
         else: res += c_trans
             
         if include_raw:
-            if c_raw: res += f"\n\n(原文: {c_raw})" if c_is_reply else f"\n\n【原文】\n{c_raw}"
+            if c_raw: res += f"\n\n(原文: {c_raw})" if c_node_type == 'REPLY' else f"\n\n【原文】\n{c_raw}"
         elif c_raw:
-            res += "\n\n(原文过长已被截断)" if c_is_reply else "\n\n【原文】\n...(日文原文过长，已被自动截断)"
+            res += "\n\n(原文过长已被截断)" if c_node_type == 'REPLY' else "\n\n【原文】\n...(日文原文过长，已被自动截断)"
                 
         if context_suffix: res += context_suffix
             
-        if ref_link: res += f"\n\n(🔗 溯源: {ref_link})" if c_is_reply else f"\n\n🔗 溯源: {ref_link}"
+        if ref_link: res += f"\n\n(🔗 溯源: {ref_link})" if c_node_type == 'REPLY' else f"\n\n🔗 溯源: {ref_link}"
                 
         if include_tail and ret_level < 3:
             res += f"\n\n{c_id}"
-            if not c_is_reply: res += "\n-由GloBot驱动"
+            if c_node_type != 'REPLY': res += "\n-由GloBot驱动"
                 
         return sanitize_for_bilibili(res)
 
@@ -140,8 +141,8 @@ def build_safe_dynamic_text(c_name, c_time, c_trans, c_raw, c_id, c_is_reply, c_
     else:
         return t2[:limit-3] + "...", "💀 形态4: 彻底崩坏级裁切"
 
-def simulate_assembly(c_id, c_trans, c_raw, c_handle, c_disp, c_is_reply, c_is_rt, c_time,
-                      p_id, p_trans, p_raw, p_handle, p_disp, p_is_reply, p_mode, p_time,
+def simulate_assembly(c_id, c_trans, c_raw, c_handle, c_disp, c_node_type, c_time,
+                      p_id, p_trans, p_raw, p_handle, p_disp, p_node_type, p_mode, p_time,
                       ret_level_str, channel_mode):
     try: ret_level = int(ret_level_str)
     except: ret_level = 0
@@ -153,13 +154,13 @@ def simulate_assembly(c_id, c_trans, c_raw, c_handle, c_disp, c_is_reply, c_is_r
     
     ref_link_mock = "https://t.bilibili.com/12345678" if p_id else ""
     
-    context_suffix = build_repost_context(p_id, p_handle, p_disp, p_is_reply, p_mode, p_time, p_trans, p_raw, ret_level, is_video)
+    context_suffix = build_repost_context(p_id, p_handle, p_disp, p_node_type, p_mode, p_time, p_trans, p_raw, ret_level, is_video)
     
     final_content, degrade_status = build_safe_dynamic_text(
-        c_name, c_time, c_trans, c_raw, c_id, c_is_reply, c_is_rt, ret_level, context_suffix, ref_link_mock, limit
+        c_name, c_time, c_trans, c_raw, c_id, c_node_type, ret_level, context_suffix, ref_link_mock, limit
     )
     
-    out_title = "" if c_is_reply or c_is_rt else c_name
+    out_title = "" if c_node_type in ["REPLY", "RETWEET"] else c_name
     action = f"{degrade_status} (实际字数: {len(final_content)} / 上限: {limit})"
 
     return out_title, final_content, action
@@ -186,8 +187,8 @@ with gr.Blocks(title="GloBot 排版沙盒") as demo:
                 curr_handle = gr.Textbox(label="原生 Handle")
                 curr_disp = gr.Textbox(label="原生显示昵称")
             with gr.Row():
-                curr_is_reply = gr.Checkbox(label="是回复吗？")
-                curr_is_rt = gr.Checkbox(label="是纯转推吗？")
+                # 🚨 升级为枚举下拉框
+                curr_node_type = gr.Dropdown(label="👑 原生 DNA (node_type)", choices=["ORIGINAL", "QUOTE", "REPLY", "RETWEET"], value="ORIGINAL")
             curr_time = gr.Textbox(label="时间戳")
 
         with gr.Column(scale=1):
@@ -198,7 +199,7 @@ with gr.Blocks(title="GloBot 排版沙盒") as demo:
                 prev_handle = gr.Textbox(label="原生 Handle")
                 prev_disp = gr.Textbox(label="原生显示昵称")
             with gr.Row():
-                prev_is_reply = gr.Checkbox(label="是回复吗？")
+                prev_node_type = gr.Dropdown(label="👑 原生 DNA", choices=["ORIGINAL", "QUOTE", "REPLY", "RETWEET"], value="ORIGINAL")
                 prev_mode = gr.Dropdown(label="🚨 发包模式", choices=["original", "repost"], value="repost")
             prev_time = gr.Textbox(label="时间戳")
             
@@ -221,14 +222,14 @@ with gr.Blocks(title="GloBot 排版沙盒") as demo:
     fetch_btn.click(
         fn=fetch_local_data,
         inputs=[curr_id_in, prev_id_in],
-        outputs=[curr_trans, curr_raw, curr_handle, curr_disp, curr_is_reply, curr_is_rt, curr_time,
-                 prev_trans, prev_raw, prev_handle, prev_disp, prev_is_reply, prev_mode, prev_time]
+        outputs=[curr_trans, curr_raw, curr_handle, curr_disp, curr_node_type, curr_time,
+                 prev_trans, prev_raw, prev_handle, prev_disp, prev_node_type, prev_mode, prev_time]
     )
     
     sim_btn.click(
         fn=simulate_assembly,
-        inputs=[curr_id_in, curr_trans, curr_raw, curr_handle, curr_disp, curr_is_reply, curr_is_rt, curr_time,
-                prev_id_in, prev_trans, prev_raw, prev_handle, prev_disp, prev_is_reply, prev_mode, prev_time,
+        inputs=[curr_id_in, curr_trans, curr_raw, curr_handle, curr_disp, curr_node_type, curr_time,
+                prev_id_in, prev_trans, prev_raw, prev_handle, prev_disp, prev_node_type, prev_mode, prev_time,
                 retention_level, channel_mode],
         outputs=[out_title, out_content, out_action]
     )

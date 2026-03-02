@@ -42,7 +42,13 @@ crawlers:
     max_retries: 3                  # 遇到死信前最多重试 3 次
     scroll_timeout_ms: 4000         # 等待 GraphQL 响应的超时时间
     scroll_depth: 3000              # Playwright 滚轮下滑深度
+    # 👇 新增：仿生作息时间 (生物钟)，支持跨零点配置
+    sleep_schedule:
+      enable: true
+      start_time: "02:00"           # 凌晨 2 点开始蛰伏
+      end_time: "07:00"             # 早上 7 点自动苏醒
   
+      
   # 平台独立开关
   x_twitter:
     enable: true
@@ -81,8 +87,8 @@ publishers:
 
     # --- B. 智能分发路由 (内容开关) ---
     publish_text_image: true         # 默认开启：如果有图文/纯文本，则发布 B 站动态
-    publish_original_video: false    # 实验性：直接把没压字幕的生肉视频发出去
-    publish_translated_video: true  # 实验性：把 AI 翻译并压制好双语字幕的视频发出去
+    publish_original_video: true    # 实验性：允许把没压字幕的生肉视频发出去
+    publish_translated_video: true  # 实验性：允许把 AI 翻译并压制好双语字幕的视频发出去
 
     # --- C. 视频投稿安全参数 (⚠️敏感凭证 SESSDATA/JCT 必须放在 .env 文件中) ---
     video_copyright: 2           # 视频稿件类型 (1: 原创, 2: 转载)

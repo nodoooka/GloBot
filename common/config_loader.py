@@ -21,10 +21,17 @@ class TargetConfig(BaseModel):
     x_accounts: list[str]
     account_title_map: dict[str, str] = Field(default_factory=dict)
 
+# 👇 新增：作息时间数据模型
+class SleepScheduleConfig(BaseModel):
+    enable: bool = True
+    start_time: str = "02:00"
+    end_time: str = "07:00"
+
 class CrawlerGlobalSettings(BaseModel):
     max_retries: int = Field(default=3, ge=1, le=5) 
     scroll_timeout_ms: int
     scroll_depth: int
+    sleep_schedule: SleepScheduleConfig = Field(default_factory=SleepScheduleConfig) # 👈 注入配置
 
 class CrawlerPlatformConfig(BaseModel):
     enable: bool = False

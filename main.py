@@ -10,7 +10,6 @@ import traceback
 from pathlib import Path
 from datetime import datetime
 
-# 👇 安全读取全局配置与被隔离的隐私账号名
 from common.config_loader import settings, BILI_ACCOUNT_NAME
 from Bot_Crawler.twitter_scraper import fetch_timeline
 from Bot_Crawler.tweet_parser import parse_timeline_json
@@ -19,9 +18,6 @@ from Bot_Media.media_pipeline import dispatch_media
 from Bot_Publisher.bili_uploader import smart_publish, smart_repost, get_dynamic_id_by_bvid
 from common.text_sanitizer import sanitize_for_bilibili
 
-# ==========================================
-# 🔇 全局日志静音配置 (防刷屏)
-# ==========================================
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext.Updater").setLevel(logging.CRITICAL)
@@ -72,13 +68,13 @@ def cleanup_old_media(retention_days=2.0):
                     file_path.unlink()
                     deleted_files += 1
                 except Exception as e:
-                    logger.error(f"❌ 无法删除过期文件 {file_path.name}: {e}")
+                    pass
     for member_dir in media_dir.iterdir():
         if member_dir.is_dir() and not any(member_dir.iterdir()):
             try: member_dir.rmdir()
             except: pass
     if deleted_files > 0:
-        logger.info(f"🧹 [空间管理] 触发自动清理！已永久销毁 {deleted_files} 个陈旧文件。")
+        logger.info(f"🧹 [空间管理] 触发自动清理！已永久销毁 {deleted_files} 个陈旧媒体文件。")
 
 async def process_media_files(media_list):
     final_paths = []
@@ -107,20 +103,17 @@ def cleanup_media(media_paths):
             try: Path(f).unlink()
             except: pass
 
-# ==========================================
-# 🧩 模块 A：溯源引擎 (带极简压缩)
-# ==========================================
 def build_repost_context(prev_tw_id, dyn_map, settings_obj, id_retention_level, is_video_mode=False):
     if not prev_tw_id or prev_tw_id not in dyn_map: return ""
     prev_info = dyn_map[prev_tw_id]
     if not isinstance(prev_info, dict): return "" 
         
     p_mode = prev_info.get("publish_mode", "repost")
-    if p_mode == "original": return ""  # 🚨 智能刹车
+    if p_mode == "original": return "" 
         
     p_handle = prev_info.get("author_handle", "")
     p_disp = prev_info.get("author_display_name", p_handle)
-    p_is_reply = prev_info.get("is_reply", False)
+    p_node_type = prev_info.get("node_type", "ORIGINAL")
     p_dt = prev_info.get("dt_str", "")
     p_trans = prev_info.get("translated_text", "")
     p_raw = prev_info.get("raw_text", "")
@@ -129,15 +122,14 @@ def build_repost_context(prev_tw_id, dyn_map, settings_obj, id_retention_level, 
     my_account = BILI_ACCOUNT_NAME
     
     if is_video_mode:
-        # 视频动态极限模式：溯源控制在 40 字以内
         c_trans_p = p_trans.replace('\n', ' ')
         if len(c_trans_p) > 25: c_trans_p = c_trans_p[:25] + "..."
-        if p_is_reply:
+        if p_node_type == 'REPLY':
             return f"\n//@{my_account}: 💬{p_name}回复: {c_trans_p}"
         else:
             return f"\n//@{my_account}: {p_name}: {c_trans_p}"
     else:
-        if p_is_reply:
+        if p_node_type == 'REPLY':
             c_trans_p = p_trans.replace('\n', ' ')
             c_raw_p = p_raw.replace('\n', ' ')
             return f"\n//@{my_account}: 💬{p_name}回复说： {c_trans_p} 【原文】 {c_raw_p}"
@@ -147,11 +139,8 @@ def build_repost_context(prev_tw_id, dyn_map, settings_obj, id_retention_level, 
                 retention_str = f"\n\n{prev_tw_id}\n-由GloBot驱动"
             return f"\n//@{my_account}: {p_name}\n\n{p_dt}\n\n{p_trans}\n\n【原文】\n{p_raw}{retention_str}"
 
-# ==========================================
-# 🧩 模块 B：四步阶梯限流组装引擎 (Safe Content Builder)
-# ==========================================
-def build_safe_dynamic_text(c_name, c_time, c_trans, c_raw, c_id, c_is_reply, c_is_rt, ret_level, context_suffix, ref_link, limit):
-    if c_is_rt:
+def build_safe_dynamic_text(c_name, c_time, c_trans, c_raw, c_id, c_node_type, ret_level, context_suffix, ref_link, limit):
+    if c_node_type == 'RETWEET':
         text = f"{c_name} 转发\n{c_time}"
         if context_suffix: text += context_suffix
         if ref_link: text += f"\n\n🔗 溯源: {ref_link}"
@@ -159,7 +148,7 @@ def build_safe_dynamic_text(c_name, c_time, c_trans, c_raw, c_id, c_is_reply, c_
         return sanitize_for_bilibili(text[:limit])
 
     def assemble(include_tail, include_raw, truncate_trans_len=None):
-        res = f"💬{c_name}回复说：\n" if c_is_reply else f"{c_time}\n\n"
+        res = f"💬{c_name}回复说：\n" if c_node_type == 'REPLY' else f"{c_time}\n\n"
             
         if truncate_trans_len is not None:
             res += c_trans[:truncate_trans_len] + "..."
@@ -168,36 +157,32 @@ def build_safe_dynamic_text(c_name, c_time, c_trans, c_raw, c_id, c_is_reply, c_
             
         if include_raw:
             if c_raw:
-                res += f"\n\n(原文: {c_raw})" if c_is_reply else f"\n\n【原文】\n{c_raw}"
+                res += f"\n\n(原文: {c_raw})" if c_node_type == 'REPLY' else f"\n\n【原文】\n{c_raw}"
         elif c_raw:
-            res += "\n\n(原文过长已被截断)" if c_is_reply else "\n\n【原文】\n...(日文原文过长，已被自动截断)"
+            res += "\n\n(原文过长已被截断)" if c_node_type == 'REPLY' else "\n\n【原文】\n...(日文原文过长，已被自动截断)"
                 
         if context_suffix:
             res += context_suffix
             
         if ref_link:
-            res += f"\n\n(🔗 溯源: {ref_link})" if c_is_reply else f"\n\n🔗 溯源: {ref_link}"
+            res += f"\n\n(🔗 溯源: {ref_link})" if c_node_type == 'REPLY' else f"\n\n🔗 溯源: {ref_link}"
                 
         if include_tail and ret_level < 3:
             res += f"\n\n{c_id}"
-            if not c_is_reply:
+            if c_node_type != 'REPLY':
                 res += "\n-由GloBot驱动"
                 
         return sanitize_for_bilibili(res)
 
-    # 🟢 形态 0: 完全体
     t0 = assemble(True, True)
     if len(t0) <= limit: return t0
     
-    # 🟡 形态 1: 褪去尾巴
     t1 = assemble(False, True)
     if len(t1) <= limit: return t1
     
-    # 🟠 形态 2: 丢弃日文生肉
     t2 = assemble(False, False)
     if len(t2) <= limit: return t2
     
-    # 🔴 形态 3: 极限裁切 (针对 220字 视频动态通道)
     fixed_len = len(assemble(False, False, truncate_trans_len=0))
     avail = limit - fixed_len - 5
     if avail > 0:
@@ -213,12 +198,8 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
     prev_dyn_id = None
     prev_tw_id = None 
     
-    # ==========================================
-    # 🔗 第一阶段：处理祖先节点
-    # ==========================================
     for ancestor in tweet.get('quote_chain', []):
         anc_id = str(ancestor['id'])
-        is_reply = ancestor.get('is_reply', False)
         is_placeholder = ancestor.get('is_placeholder', False)
         
         if anc_id in dyn_map:
@@ -234,6 +215,8 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
             continue
             
         logger.info(f"   -> ⛓️ 发现全新未搬运的祖先节点！开始穿透发布: @{ancestor['author']}")
+        
+        anc_node_type = ancestor.get('node_type', 'ORIGINAL')
         anc_translated = preprocessing_cache[anc_id]['translated_text']
         dt_str = datetime.fromtimestamp(ancestor['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
         clean_raw = html.unescape(ancestor['text'])
@@ -250,7 +233,6 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
         vid_path = next((p for p in anc_media if str(p).lower().endswith('.mp4')), None) if has_anc_video else None
         has_any_media = len(anc_media) > 0
         
-        # 📌 路由流向侦测 (预判 Limit 阈值)
         is_video_route = False
         fallback_to_publish = False
         ref_link = ""
@@ -277,11 +259,11 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
 
         limit = 220 if is_video_route else 950
         context_suffix = build_repost_context(prev_tw_id, dyn_map, settings, id_retention_level, is_video_mode=is_video_route)
-        settings.publishers.bilibili.title = "" if is_reply else display_name
+        settings.publishers.bilibili.title = "" if anc_node_type in ["REPLY", "RETWEET"] else display_name
 
         anc_content = build_safe_dynamic_text(
             c_name=display_name, c_time=dt_str, c_trans=anc_translated, c_raw=clean_raw, c_id=anc_id,
-            c_is_reply=is_reply, c_is_rt=False, ret_level=id_retention_level, 
+            c_node_type=anc_node_type, ret_level=id_retention_level, 
             context_suffix=context_suffix, ref_link=ref_link, limit=limit
         )
 
@@ -289,7 +271,7 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
             if fallback_to_publish:
                 if vid_path:
                     logger.info(f"   -> 🆕 [智能降级] 含媒体/反查拦截，转为独立视频投稿 (附溯源)...")
-                    success, new_anc_dyn_id = await upload_video_bilibili(vid_path, display_name[:80] if not is_reply else f"{display_name}的视频回复", anc_content, anc_source_url, settings)
+                    success, new_anc_dyn_id = await upload_video_bilibili(vid_path, display_name[:80] if anc_node_type != 'REPLY' else f"{display_name}的视频回复", anc_content, anc_source_url, settings)
                 else:
                     logger.info(f"   -> 🆕 [智能降级] 含媒体/反查拦截，转为独立图文动态 (附溯源)...")
                     success, new_anc_dyn_id = await smart_publish(anc_content, anc_media, video_type=anc_video_type)
@@ -299,7 +281,7 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
         else:
             if vid_path:
                 logger.info(f"   -> 🆕 [祖先节点] 移交视频投稿中枢...")
-                success, new_anc_dyn_id = await upload_video_bilibili(vid_path, display_name[:80] if not is_reply else f"{display_name}的视频回复", anc_content, anc_source_url, settings)
+                success, new_anc_dyn_id = await upload_video_bilibili(vid_path, display_name[:80] if anc_node_type != 'REPLY' else f"{display_name}的视频回复", anc_content, anc_source_url, settings)
             else:
                 logger.info(f"   -> 🆕 正在将推文树的最底层根节点进行首发...")
                 success, new_anc_dyn_id = await smart_publish(anc_content, anc_media, video_type=anc_video_type)
@@ -309,7 +291,7 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
         if success and new_anc_dyn_id:
             dyn_map[anc_id] = {
                 "dyn_id": new_anc_dyn_id, "author_handle": author_handle, "author_display_name": author_display,
-                "is_reply": is_reply, "dt_str": dt_str, "translated_text": anc_translated, "raw_text": clean_raw, "publish_mode": curr_publish_mode
+                "node_type": anc_node_type, "dt_str": dt_str, "translated_text": anc_translated, "raw_text": clean_raw, "publish_mode": curr_publish_mode
             }
             save_dyn_map(dyn_map)
             prev_dyn_id = new_anc_dyn_id
@@ -326,25 +308,23 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
     logger.info(f"   -> 👑 链路穿透完成，开始处理最终成员点评！")
     
     tw_id = str(tweet['id'])
-    is_pure_retweet = tweet.get('is_pure_retweet', False)
+    tw_node_type = tweet.get('node_type', 'ORIGINAL')
     
     author_handle = tweet['author']
     display_name = settings.targets.account_title_map.get(author_handle, tweet.get('author_display_name', f"@{author_handle}"))
     dt_str = datetime.fromtimestamp(tweet['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
-    is_leaf_reply = tweet.get('is_reply', False)
     
-    translated_text = "" if is_pure_retweet else preprocessing_cache[tw_id]['translated_text']
-    clean_raw_text = "" if is_pure_retweet else html.unescape(tweet['text'])
+    translated_text = "" if tw_node_type == 'RETWEET' else preprocessing_cache[tw_id]['translated_text']
+    clean_raw_text = "" if tw_node_type == 'RETWEET' else html.unescape(tweet['text'])
     
-    final_media = [] if is_pure_retweet else preprocessing_cache[tw_id]['final_media']
-    video_type = "none" if is_pure_retweet else preprocessing_cache[tw_id]['video_type']
+    final_media = [] if tw_node_type == 'RETWEET' else preprocessing_cache[tw_id]['final_media']
+    video_type = "none" if tw_node_type == 'RETWEET' else preprocessing_cache[tw_id]['video_type']
     has_final_video = (video_type == "translated" and settings.publishers.bilibili.publish_translated_video) or \
                       (video_type == "original" and settings.publishers.bilibili.publish_original_video)
     vid_path = next((p for p in final_media if str(p).lower().endswith('.mp4')), None) if has_final_video else None
     has_any_media = len(final_media) > 0 
     final_source_url = f"https://x.com/{tweet['author']}/status/{tw_id}"
 
-    # 📌 路由流向侦测
     is_video_route = False
     fallback_to_publish = False
     ref_link = ""
@@ -370,11 +350,11 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
 
     limit = 220 if is_video_route else 950
     context_suffix = build_repost_context(prev_tw_id, dyn_map, settings, id_retention_level, is_video_mode=is_video_route)
-    settings.publishers.bilibili.title = "" if is_leaf_reply or is_pure_retweet else display_name
+    settings.publishers.bilibili.title = "" if tw_node_type in ["REPLY", "RETWEET"] else display_name
 
     final_content = build_safe_dynamic_text(
         c_name=display_name, c_time=dt_str, c_trans=translated_text, c_raw=clean_raw_text, c_id=tw_id,
-        c_is_reply=is_leaf_reply, c_is_rt=is_pure_retweet, ret_level=id_retention_level, 
+        c_node_type=tw_node_type, ret_level=id_retention_level, 
         context_suffix=context_suffix, ref_link=ref_link, limit=limit
     )
 
@@ -382,7 +362,7 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
         if fallback_to_publish:
             if vid_path:
                 logger.info("   -> 🆕 [智能降级] 含媒体/反查拦截，转为独立视频投稿 (附溯源)...")
-                success, new_dyn_id = await upload_video_bilibili(vid_path, display_name[:80] if not is_leaf_reply else f"{display_name}的视频回复", final_content, final_source_url, settings)
+                success, new_dyn_id = await upload_video_bilibili(vid_path, display_name[:80] if tw_node_type != 'REPLY' else f"{display_name}的视频回复", final_content, final_source_url, settings)
             else:
                 logger.info("   -> 🆕 [智能降级] 源头为视频/包含媒体，转为独立图文动态 (附视频链接)...")
                 success, new_dyn_id = await smart_publish(final_content, final_media, video_type=video_type)
@@ -392,14 +372,13 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
     else:
         if vid_path:
             logger.info("   -> 移交视频投稿中枢...")
-            success, new_dyn_id = await upload_video_bilibili(vid_path, display_name[:80] if not is_leaf_reply else f"{display_name}的视频回复", final_content, final_source_url, settings)
+            success, new_dyn_id = await upload_video_bilibili(vid_path, display_name[:80] if tw_node_type != 'REPLY' else f"{display_name}的视频回复", final_content, final_source_url, settings)
         else:
             logger.info("   -> 移交图文首发中枢 (降级处理)...")
             success, new_dyn_id = await smart_publish(final_content, final_media, video_type=video_type)
         
     cleanup_media(final_media)
     return success, new_dyn_id, curr_publish_mode
-
 
 async def pipeline_loop():
     logger.info("🤖 GloBot 工业流水线已启动...")
@@ -413,12 +392,56 @@ async def pipeline_loop():
     while True:
         try:
             await GloBotState.is_running.wait()
+            
+            # 🕒 仿生作息时间拦截 (Biological Clock)
+            sleep_cfg = settings.crawlers.global_settings.sleep_schedule
+            if sleep_cfg.enable:
+                try:
+                    now_dt = datetime.now()
+                    curr_time = now_dt.time()
+                    t_start = datetime.strptime(sleep_cfg.start_time, "%H:%M").time()
+                    t_end = datetime.strptime(sleep_cfg.end_time, "%H:%M").time()
+                    
+                    is_sleeping_time = False
+                    if t_start <= t_end:
+                        is_sleeping_time = t_start <= curr_time <= t_end
+                    else:
+                        is_sleeping_time = curr_time >= t_start or curr_time <= t_end
+                        
+                    if is_sleeping_time:
+                        logger.info(f"🌙 触发仿生休眠期 ({sleep_cfg.start_time} - {sleep_cfg.end_time})，系统进入深度蛰伏...")
+                        GloBotState.is_sleeping = True
+                        GloBotState.wake_up_event.clear()
+                        try: 
+                            # 采取每 10 分钟轮询一次的柔性睡眠，以支持 /force 强制唤醒
+                            await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=600)
+                            logger.info("⚡ 收到强制唤醒信号，提前结束蛰伏！")
+                        except asyncio.TimeoutError: 
+                            pass
+                        finally: 
+                            GloBotState.is_sleeping = False
+                        continue
+                except Exception as e:
+                    logger.error(f"⚠️ 作息时间解析异常，忽略休眠: {e}")
+
+            # ♻️ 物理素材垃圾回收
             if time.time() - last_cleanup_time > 12 * 3600:
                 cleanup_old_media(getattr(settings.system, 'media_retention_days', 2.0))
                 last_cleanup_time = time.time()
 
             logger.info("\n📡 启动爬虫嗅探...")
-            await fetch_timeline()
+            
+            # 🚨 T0 级推特账号风控熔断墙
+            try:
+                await fetch_timeline()
+            except RuntimeError as e:
+                if "TWITTER_AUTH_EXPIRED" in str(e):
+                    logger.critical(f"🛑 [熔断机制] 侦测到推特账号异常，强行切断流水线: {e}")
+                    GloBotState.is_running.clear()
+                    await send_tg_error(f"🛑 <b>推特账号疑似被风控！</b>\n\n异常追踪：\n<code>{e}</code>\n\n为防止被死封，爬虫流水线已<b>物理挂起</b>。\n👉 请确认账号存活，如果有必要请重新运行登录脚本更新 cookie，之后发送 /resume 恢复运行。")
+                    continue
+                else: raise e
+                
             json_files = list(RAW_DIR.glob("*.json"))
             if not json_files:
                 logger.info("💤 未发现 JSON 矿石，休眠 60 秒...")
@@ -461,7 +484,7 @@ async def pipeline_loop():
                     if not anc.get('is_placeholder') and anc_id not in dyn_map and anc_id not in unique_nodes:
                         unique_nodes[anc_id] = anc
                 tw_id = str(tweet['id'])
-                if not tweet.get('is_pure_retweet'):
+                if tweet.get('node_type') != 'RETWEET':
                     if tw_id not in unique_nodes: unique_nodes[tw_id] = tweet
 
             preprocessing_cache = {}
@@ -481,9 +504,9 @@ async def pipeline_loop():
                     await asyncio.gather(*(process_one(n) for n in unique_nodes.values()))
                 except RuntimeError as e:
                     if "LLM_TRANSLATION_FAILED" in str(e):
-                        logger.critical(f"🛑 [熔断机制] 侦测到大模型翻译引擎宕机，强行切断流水线: {e}")
+                        logger.critical(f"🛑 [熔断机制] 侦测到大模型翻译引擎宕机: {e}")
                         GloBotState.is_running.clear()
-                        await send_tg_error(f"🛑 <b>大模型翻译引擎发生 T0 级宕机！</b>\n\n错误溯源：\n<code>{e}</code>\n\n⚠️ <b>致命拦截触发：</b>\n为防止向 B 站发送未翻译的生肉动态，GloBot 物理主阀门已被强制关闭！所有的发布流水线已无限期挂起。\n\n👉 请检查您的 API 密钥额度或网络连通性。\n👉 确认故障排除后，请在此发送 /resume 指令，总线将自动恢复运转并重试堆积的任务。")
+                        await send_tg_error(f"🛑 <b>大模型发生 T0 级宕机！</b>\n\n<code>{e}</code>\n\n为防生肉流出，GloBot 主阀门已锁定。\n👉 请确认修复后发送 /resume 恢复。")
                         continue  
                     else: raise e
 
@@ -498,38 +521,37 @@ async def pipeline_loop():
                         save_history(history_set)
                         if new_dyn_id:
                             dt_str = datetime.fromtimestamp(tweet['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
-                            t_trans = "" if tweet.get('is_pure_retweet') else preprocessing_cache[tweet_id]['translated_text']
-                            t_raw = "" if tweet.get('is_pure_retweet') else html.unescape(tweet['text'])
+                            leaf_node_type = tweet.get('node_type', 'ORIGINAL')
+                            
+                            t_trans = "" if leaf_node_type == 'RETWEET' else preprocessing_cache[tweet_id]['translated_text']
+                            t_raw = "" if leaf_node_type == 'RETWEET' else html.unescape(tweet['text'])
+                            
                             dyn_map[tweet_id] = {
                                 "dyn_id": new_dyn_id, "author_handle": tweet['author'], "author_display_name": tweet.get('author_display_name', f"@{tweet['author']}"),
-                                "is_reply": tweet.get('is_reply', False), "dt_str": dt_str, "translated_text": t_trans, "raw_text": t_raw, "publish_mode": leaf_publish_mode
+                                "node_type": leaf_node_type, "dt_str": dt_str, "translated_text": t_trans, "raw_text": t_raw, "publish_mode": leaf_publish_mode
                             }
                             save_dyn_map(dyn_map)
                         logger.info(f"✅ 任务 {i+1}/{total} [{tweet_id}] 成功发射！")
                         GloBotState.daily_stats['success'] += 1 
                         if not str(new_dyn_id).startswith("BV"): 
-                            await send_tg_msg(f"🎉 <b>图文搬运成功</b> [{i+1}/{total}]\n推特源: <code>{tweet_id}</code>\n成功生成 B站动态: <code>{new_dyn_id}</code>")
+                            await send_tg_msg(f"🎉 <b>图文搬运成功</b> [{i+1}/{total}]\n推特源: <code>{tweet_id}</code>\nB站动态: <code>{new_dyn_id}</code>")
                     else:
                         logger.error(f"❌ 推文 {tweet_id} 发布失败！")
                         GloBotState.daily_stats['failed'] += 1   
-                        await send_tg_msg(f"❌ <b>搬运受阻</b> [{i+1}/{total}]\n推特源: <code>{tweet_id}</code>\n未能成功发布，请检查终端日志排查。")
+                        await send_tg_msg(f"❌ <b>搬运受阻</b> [{i+1}/{total}]\n推特源: <code>{tweet_id}</code>\n未能成功发布。")
                         continue
                 except RuntimeError as e: 
                     if "AUTH_EXPIRED" in str(e):
                         logger.critical(f"🛑 [熔断机制] 侦测到凭证失效，强行切断流水线: {e}")
                         GloBotState.is_running.clear() 
-                        await send_tg_error(f"🛑 <b>安全熔断机制触发！</b>\n\n检测到账号令牌失效或被拦截：\n<code>{e}</code>\n\n为防止无限重试导致死封，流水线已<b>强制物理挂起</b>。\n👉 请在终端运行 `python Bot_Publisher/bili_login.py` 重新扫码，更新凭证后发送 <code>/resume</code> 恢复运行。")
+                        await send_tg_error(f"🛑 <b>安全熔断机制触发！</b>\n\n<code>{e}</code>\n\n为防死封，流水线已<b>物理挂起</b>。\n👉 重新扫码后发送 /resume。")
                         break 
                     else:
-                        err_trace = traceback.format_exc()
                         logger.error(f"🔥 处理推文 {tweet_id} 时发生运行时异常: {e}")
-                        await send_tg_error(f"处理推文崩溃:\n{err_trace[-300:]}")
                         GloBotState.daily_stats['failed'] += 1
                         continue
                 except Exception as e:
-                    err_trace = traceback.format_exc()
                     logger.error(f"🔥 处理推文 {tweet_id} 时发生内部崩溃: {e}")
-                    await send_tg_error(f"处理推文 {tweet_id} 崩溃:\n{err_trace[-300:]}")
                     GloBotState.daily_stats['failed'] += 1
                     continue
                     
@@ -548,7 +570,6 @@ async def pipeline_loop():
         except asyncio.CancelledError: break
         except Exception as e:
             logger.error(f"🔥 总线发生未捕获异常: {e}")
-            await send_tg_error(f"总线挂机大崩溃:\n{traceback.format_exc()[-400:]}")
             await asyncio.sleep(60)
 
 async def main_master():
