@@ -1,0 +1,28 @@
+# ==========================================
+# GloBot Matrix - 核心依赖清单
+# ==========================================
+
+# 1. 爬虫与网络层
+playwright>=1.40.0
+httpx>=0.25.0
+aiohttp>=3.9.0
+
+# 2. 核心控制总线
+pydantic>=2.5.0
+python-telegram-bot[job-queue]>=20.7
+PyYAML>=6.0.1
+python-dotenv>=1.0.0
+
+# 3. LLM 与 AI 翻译引擎
+openai>=1.10.0
+
+# 4. 多媒体视觉与听觉处理
+opencv-python>=4.8.0
+gradio>=4.0.0
+
+# ==========================================
+# 🍎 Mac Apple Silicon (M1/M2/M3) 专属硬件加速库
+# ==========================================
+mlx-whisper; sys_platform == "darwin" and platform_machine == "arm64"
+pyobjc-core; sys_platform == "darwin"
+pyobjc-framework-Vision; sys_platform == "darwin"
