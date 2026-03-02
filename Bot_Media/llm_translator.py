@@ -16,14 +16,27 @@ from Bot_Media.rag_manager import RAGManager
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# 👇 补回刚才遗漏的环境变量读取！
 WORKER_BASE_URL = os.getenv("WORKER_BASE_URL", "https://open.bigmodel.cn/api/paas/v4/")
 WORKER_MODEL = os.getenv("WORKER_MODEL", "glm-4-flash")
 
 MASTER_BASE_URL = os.getenv("MASTER_BASE_URL", "https://api.deepseek.com") 
 MASTER_MODEL = os.getenv("MASTER_MODEL", "deepseek-chat")
 
-worker_client = AsyncOpenAI(api_key=WORKER_GLM_API_KEY, base_url=WORKER_BASE_URL) if WORKER_GLM_API_KEY else None
-master_client = AsyncOpenAI(api_key=MASTER_LLM_API_KEY, base_url=MASTER_BASE_URL) if MASTER_LLM_API_KEY else None
+# 彻底关闭官方默认套娃重试，由我们全权接管控制流
+worker_client = AsyncOpenAI(
+    api_key=WORKER_GLM_API_KEY, 
+    base_url=WORKER_BASE_URL, 
+    timeout=180.0, 
+    max_retries=0
+) if WORKER_GLM_API_KEY else None
+
+master_client = AsyncOpenAI(
+    api_key=MASTER_LLM_API_KEY, 
+    base_url=MASTER_BASE_URL, 
+    timeout=180.0, 
+    max_retries=0
+) if MASTER_LLM_API_KEY else None
 
 rag = RAGManager()
 
@@ -36,7 +49,7 @@ class SubtitleBatch(BaseModel):
     lines: list[SubtitleLine]
 
 # ==========================================
-# 🚀 单句翻译（保持纯文本输出，加入重试装甲）
+# 🚀 单句翻译（引入 SSE 流式防断连装甲）
 # ==========================================
 async def translate_text(jp_text: str, is_subtitle: bool = False) -> str:
     if not jp_text.strip(): return ""
@@ -48,25 +61,39 @@ async def translate_text(jp_text: str, is_subtitle: bool = False) -> str:
     active_client, active_model = master_client, MASTER_MODEL
     system_prompt = settings.prompts.video_translation_prompt if is_subtitle else settings.prompts.tweet_translation_prompt
     
-    # 吸收 Grok 的优点：加入重试与动态温度
     for attempt in range(3):
         try:
-            messages_payload = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"请翻译以下推文：\n<text>\n{clean_jp_text}\n</text>\n\n{rag_context}"}
-            ]
-            
             response = await active_client.chat.completions.create(
                 model=active_model,
-                messages=messages_payload,
-                temperature=0.3 + (attempt * 0.1), # 重试时增加一点创意
-                max_tokens=500
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"请翻译以下推文：\n<text>\n{clean_jp_text}\n</text>\n\n{rag_context}"}
+                ],
+                temperature=0.3 + (attempt * 0.1),
+                max_tokens=500,
+                stream=True  # 👈 核心救命稻草：开启流式传输，防网关 30 秒强杀
             )
             
-            result = response.choices[0].message.content.strip()
+            result_chunks = []
+            async for chunk in response:
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta
+                    if hasattr(delta, 'content') and delta.content:
+                        result_chunks.append(delta.content)
             
+            result = "".join(result_chunks).strip()
+            
+            # 清理可能被思考模型暴露出来的 <think> 标签内容
+            result = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL).strip()
+            
+            if "<!DOCTYPE html>" in result[:50].lower():
+                raise RuntimeError(f"API 网关返回了异常网页: {result[:100]}...")
+
             if not result:
                 raise RuntimeError("LLM 返回了空字符串")
+            
+            # 👇 把这句话加上，以后它重试成功了你就看得到了
+            logger.info(f"   -> [单句翻译] 成功获取文本 ({len(result)}字)")
                 
             return result
             
@@ -75,7 +102,7 @@ async def translate_text(jp_text: str, is_subtitle: bool = False) -> str:
             if attempt == 2:
                 logger.error(f"❌ 翻译彻底崩溃")
                 raise RuntimeError(f"LLM_TRANSLATION_FAILED: API 请求崩溃 - {e}")
-            await asyncio.sleep(1.5 ** attempt) # 指数退避
+            await asyncio.sleep(1.5 ** attempt)
 
 # ==========================================
 # 🚀 工业级批处理：整片视频台词一次性翻译
@@ -109,10 +136,9 @@ async def translate_batch(segments: list, ocr_results: list) -> list:
         "{\n  \"lines\": [\n    {\"id\": 1, \"text\": \"第一句翻译\"},\n    {\"id\": 2, \"text\": \"第二句翻译\"}\n  ]\n}"
     )
 
-    logger.info(f"🧠 [智能路由] 正在将 {len(segments)} 句台本打包，移交【大师节点 {active_model}】进行强格式翻译...")
+    logger.info(f"🧠 [智能路由] 正在将 {len(segments)} 句台本打包，移交【大师节点 {active_model}】进行流式长连接翻译...")
     system_prompt = settings.prompts.video_translation_prompt
 
-    # 吸收 Grok 的优点：JSON 重试环状架构
     for attempt in range(3):
         try:
             response = await active_client.chat.completions.create(
@@ -123,21 +149,30 @@ async def translate_batch(segments: list, ocr_results: list) -> list:
                     {"role": "user", "content": f"请翻译以下台本：\n<text>\n{script_text}\n</text>\n\n{rag_context}{json_instruction}"}
                 ],
                 temperature=0.2 + (attempt * 0.1), 
-                max_tokens=2000
+                max_tokens=2000,
+                stream=True  # 👈 流式防封杀
             )
             
-            output_text = response.choices[0].message.content.strip()
+            output_chunks = []
+            async for chunk in response:
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta
+                    if hasattr(delta, 'content') and delta.content:
+                        output_chunks.append(delta.content)
             
-            # 保留我的底线：Markdown 清洗防线
+            output_text = "".join(output_chunks).strip()
+            output_text = re.sub(r'<think>.*?</think>', '', output_text, flags=re.DOTALL).strip()
+            
+            if "<!DOCTYPE html>" in output_text[:50].lower():
+                raise RuntimeError(f"API 网关阻断返回 HTML 页面: {output_text[:100]}...")
+            
             if output_text.startswith("```json"): output_text = output_text[7:-3].strip()
             elif output_text.startswith("```"): output_text = output_text[3:-3].strip()
                 
             parsed_data = json.loads(output_text)
-            batch = SubtitleBatch(**parsed_data) # Pydantic 强类型接管
+            batch = SubtitleBatch(**parsed_data)
             
             translated_lines = []
-            
-            # 保留我的底线：绝对时间轴哈希映射法则
             line_map = {item.id: item.text for item in batch.lines}
             
             for i in range(len(segments)):
@@ -145,13 +180,13 @@ async def translate_batch(segments: list, ocr_results: list) -> list:
                 if line_id in line_map and line_map[line_id].strip():
                     translated_lines.append(line_map[line_id].strip())
                 else:
-                    translated_lines.append(segments[i]['text']) # 容错兜底：缺行则填入原文
+                    translated_lines.append(segments[i]['text'])
                     
             logger.info(f"✅ [JSON 批量] 成功完美映射 {len(translated_lines)} 句台词。")
             return translated_lines
             
         except (json.JSONDecodeError, ValidationError) as e:
-            logger.warning(f"⚠️ [批量翻译] 第 {attempt+1} 次解析失败: {e}")
+            logger.warning(f"⚠️ [批量翻译] 第 {attempt+1} 次解析失败: 格式损坏。")
             if attempt == 2:
                 logger.error("❌ 批量翻译彻底失败，降级为全原文输出。")
                 return [seg['text'] for seg in segments]

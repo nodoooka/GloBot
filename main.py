@@ -241,7 +241,9 @@ async def publisher_engine(queue: asyncio.Queue, engine_name: str):
             if unique_nodes:
                 logger.info(f"\n" + "="*50)
                 logger.info(f"⚡ [{engine_name}] 开始预处理 {len(unique_nodes)} 个节点...")
-                llm_sem = asyncio.Semaphore(5)
+                
+                # 🚨 止血点：将 llm_sem 从 5 降为 1 或 2，排队过闸门，防止大模型 API 拥堵超时！
+                llm_sem = asyncio.Semaphore(1) 
                 comp_sem = asyncio.Semaphore(2)
 
                 async def process_one(node):
