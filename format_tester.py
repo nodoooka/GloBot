@@ -10,25 +10,13 @@ sys.path.append(str(Path(__file__).resolve().parent))
 load_dotenv()
 
 try:
-    from common.config_loader import settings
-    from common.text_sanitizer import sanitize_for_bilibili
+    from common.config_loader import settings, BILI_ACCOUNT_NAME
+    from common.state_manager import load_dyn_map
+    from Bot_Publisher.bili_formatter import build_repost_context, build_safe_dynamic_text
 except ImportError as e:
     print(f"❌ 导入模块失败: {e}")
     sys.exit(1)
 
-BILI_ACCOUNT_NAME = os.getenv("BILI_ACCOUNT_NAME", "GloBot搬运")
-DATA_DIR = Path(os.getenv("LOCAL_DATA_DIR", f"./GloBot_Data/{settings.targets.group_name}"))
-DYN_MAP_FILE = DATA_DIR / "dyn_map.json"
-
-def load_dyn_map():
-    if not DYN_MAP_FILE.exists(): return {}
-    try:
-        with open(DYN_MAP_FILE, "r", encoding="utf-8") as f: return json.load(f)
-    except: return {}
-
-# ==========================================
-# 🔍 数据提取引擎
-# ==========================================
 def fetch_local_data(c_id, p_id):
     dyn_map = load_dyn_map()
     
@@ -45,7 +33,6 @@ def fetch_local_data(c_id, p_id):
             c_disp = c_info.get("author_display_name", "")
             c_node_type = c_info.get("node_type", "ORIGINAL")
             c_time = c_info.get("dt_str", "2026-03-01 12:00:00")
-            # 兼容老版数据
             if "is_reply" in c_info and c_info["is_reply"]: c_node_type = "REPLY"
             if not c_trans and not c_raw: c_node_type = "RETWEET"
 
@@ -63,83 +50,10 @@ def fetch_local_data(c_id, p_id):
             p_node_type = p_info.get("node_type", "ORIGINAL")
             p_mode = p_info.get("publish_mode", "repost")
             p_time = p_info.get("dt_str", "2026-03-01 10:00:00")
-            # 兼容老版数据
             if "is_reply" in p_info and p_info["is_reply"]: p_node_type = "REPLY"
 
     return (c_trans, c_raw, c_handle, c_disp, c_node_type, c_time, 
             p_trans, p_raw, p_handle, p_disp, p_node_type, p_mode, p_time)
-
-# ==========================================
-# 🚀 1:1 复制 main.py 的排版组装引擎
-# ==========================================
-def build_repost_context(p_id, p_handle, p_disp, p_node_type, p_mode, p_dt, p_trans, p_raw, ret_level, is_video_mode):
-    if not p_id: return ""
-    if p_mode == "original": return "" 
-        
-    p_name = settings.targets.account_title_map.get(p_handle, p_disp) if p_handle else p_disp
-    
-    if is_video_mode:
-        c_trans_p = p_trans.replace('\n', ' ')
-        if len(c_trans_p) > 25: c_trans_p = c_trans_p[:25] + "..."
-        if p_node_type == 'REPLY':
-            return f"\n//@{BILI_ACCOUNT_NAME}: 💬{p_name}回复: {c_trans_p}"
-        else:
-            return f"\n//@{BILI_ACCOUNT_NAME}: {p_name}: {c_trans_p}"
-    else:
-        if p_node_type == 'REPLY':
-            c_trans_p = p_trans.replace('\n', ' ')
-            c_raw_p = p_raw.replace('\n', ' ')
-            return f"\n//@{BILI_ACCOUNT_NAME}: 💬{p_name}回复说： {c_trans_p} 【原文】 {c_raw_p}"
-        else:
-            retention_str = ""
-            if ret_level < 3:
-                retention_str = f"\n\n{p_id}\n-由GloBot驱动"
-            return f"\n//@{BILI_ACCOUNT_NAME}: {p_name}\n\n{p_dt}\n\n{p_trans}\n\n【原文】\n{p_raw}{retention_str}"
-
-def build_safe_dynamic_text(c_name, c_time, c_trans, c_raw, c_id, c_node_type, ret_level, context_suffix, ref_link, limit):
-    if c_node_type == 'RETWEET':
-        text = f"{c_name} 转发\n{c_time}"
-        if context_suffix: text += context_suffix
-        if ref_link: text += f"\n\n🔗 溯源: {ref_link}"
-        if ret_level < 3: text += f"\n\n{c_id}\n-由GloBot驱动"
-        return sanitize_for_bilibili(text[:limit])
-
-    def assemble(include_tail, include_raw, truncate_trans_len=None):
-        res = f"💬{c_name}回复说：\n" if c_node_type == 'REPLY' else f"{c_time}\n\n"
-            
-        if truncate_trans_len is not None: res += c_trans[:truncate_trans_len] + "..."
-        else: res += c_trans
-            
-        if include_raw:
-            if c_raw: res += f"\n\n(原文: {c_raw})" if c_node_type == 'REPLY' else f"\n\n【原文】\n{c_raw}"
-        elif c_raw:
-            res += "\n\n(原文过长已被截断)" if c_node_type == 'REPLY' else "\n\n【原文】\n...(日文原文过长，已被自动截断)"
-                
-        if context_suffix: res += context_suffix
-            
-        if ref_link: res += f"\n\n(🔗 溯源: {ref_link})" if c_node_type == 'REPLY' else f"\n\n🔗 溯源: {ref_link}"
-                
-        if include_tail and ret_level < 3:
-            res += f"\n\n{c_id}"
-            if c_node_type != 'REPLY': res += "\n-由GloBot驱动"
-                
-        return sanitize_for_bilibili(res)
-
-    t0 = assemble(True, True)
-    if len(t0) <= limit: return t0, "✅ 形态0: 完美保留全部内容"
-    
-    t1 = assemble(False, True)
-    if len(t1) <= limit: return t1, "🟡 形态1: 切除小尾巴"
-    
-    t2 = assemble(False, False)
-    if len(t2) <= limit: return t2, "🟠 形态2: 彻底丢弃日文原文"
-    
-    fixed_len = len(assemble(False, False, truncate_trans_len=0))
-    avail = limit - fixed_len - 5
-    if avail > 0:
-        return assemble(False, False, truncate_trans_len=avail), "🔴 形态3: 发生中文极限裁切"
-    else:
-        return t2[:limit-3] + "...", "💀 形态4: 彻底崩坏级裁切"
 
 def simulate_assembly(c_id, c_trans, c_raw, c_handle, c_disp, c_node_type, c_time,
                       p_id, p_trans, p_raw, p_handle, p_disp, p_node_type, p_mode, p_time,
@@ -148,16 +62,15 @@ def simulate_assembly(c_id, c_trans, c_raw, c_handle, c_disp, c_node_type, c_tim
     except: ret_level = 0
         
     c_name = settings.targets.account_title_map.get(c_handle, c_disp) if c_handle else c_disp
-    
     is_video = channel_mode.startswith("视频")
     limit = 220 if is_video else 950
-    
     ref_link_mock = "https://t.bilibili.com/12345678" if p_id else ""
     
-    context_suffix = build_repost_context(p_id, p_handle, p_disp, p_node_type, p_mode, p_time, p_trans, p_raw, ret_level, is_video)
+    context_suffix = build_repost_context(p_id, dyn_map={p_id: {"publish_mode": p_mode, "author_handle": p_handle, "author_display_name": p_disp, "node_type": p_node_type, "dt_str": p_time, "translated_text": p_trans, "raw_text": p_raw}}, settings_obj=settings, id_retention_level=ret_level, is_video_mode=is_video)
     
+    # 🚨 调用中心引擎的 debug 模式
     final_content, degrade_status = build_safe_dynamic_text(
-        c_name, c_time, c_trans, c_raw, c_id, c_node_type, ret_level, context_suffix, ref_link_mock, limit
+        c_name, c_time, c_trans, c_raw, c_id, c_node_type, ret_level, context_suffix, ref_link_mock, limit, debug_status=True
     )
     
     out_title = "" if c_node_type in ["REPLY", "RETWEET"] else c_name
@@ -165,9 +78,6 @@ def simulate_assembly(c_id, c_trans, c_raw, c_handle, c_disp, c_node_type, c_tim
 
     return out_title, final_content, action
 
-# ==========================================
-# 🌐 Gradio 优雅网页 UI 
-# ==========================================
 with gr.Blocks(title="GloBot 排版沙盒") as demo:
     gr.Markdown(f"## 🛠️ GloBot 动态排版拼装沙盒 (当前挂载号: `@{BILI_ACCOUNT_NAME}`)")
     
@@ -187,7 +97,6 @@ with gr.Blocks(title="GloBot 排版沙盒") as demo:
                 curr_handle = gr.Textbox(label="原生 Handle")
                 curr_disp = gr.Textbox(label="原生显示昵称")
             with gr.Row():
-                # 🚨 升级为枚举下拉框
                 curr_node_type = gr.Dropdown(label="👑 原生 DNA (node_type)", choices=["ORIGINAL", "QUOTE", "REPLY", "RETWEET"], value="ORIGINAL")
             curr_time = gr.Textbox(label="时间戳")
 
@@ -219,20 +128,8 @@ with gr.Blocks(title="GloBot 排版沙盒") as demo:
         with gr.Column(scale=2):
             out_content = gr.Textbox(label="最终发向 B 站的正文 (Content)", lines=12)
 
-    fetch_btn.click(
-        fn=fetch_local_data,
-        inputs=[curr_id_in, prev_id_in],
-        outputs=[curr_trans, curr_raw, curr_handle, curr_disp, curr_node_type, curr_time,
-                 prev_trans, prev_raw, prev_handle, prev_disp, prev_node_type, prev_mode, prev_time]
-    )
-    
-    sim_btn.click(
-        fn=simulate_assembly,
-        inputs=[curr_id_in, curr_trans, curr_raw, curr_handle, curr_disp, curr_node_type, curr_time,
-                prev_id_in, prev_trans, prev_raw, prev_handle, prev_disp, prev_node_type, prev_mode, prev_time,
-                retention_level, channel_mode],
-        outputs=[out_title, out_content, out_action]
-    )
+    fetch_btn.click(fn=fetch_local_data, inputs=[curr_id_in, prev_id_in], outputs=[curr_trans, curr_raw, curr_handle, curr_disp, curr_node_type, curr_time, prev_trans, prev_raw, prev_handle, prev_disp, prev_node_type, prev_mode, prev_time])
+    sim_btn.click(fn=simulate_assembly, inputs=[curr_id_in, curr_trans, curr_raw, curr_handle, curr_disp, curr_node_type, curr_time, prev_id_in, prev_trans, prev_raw, prev_handle, prev_disp, prev_node_type, prev_mode, prev_time, retention_level, channel_mode], outputs=[out_title, out_content, out_action])
 
 if __name__ == "__main__":
     print(f"🌐 正在启动排版沙盒环境，已加载账号: @{BILI_ACCOUNT_NAME} ...")

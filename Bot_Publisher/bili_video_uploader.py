@@ -9,10 +9,8 @@ from Bot_Master.tg_bot import ask_video_approval, GloBotState, send_tg_msg
 
 logger = logging.getLogger("GloBot_VideoUp")
 
-# 指向我们刚建立的安全凭证库
 AUTH_FILE = Path(__file__).resolve().parent.parent / "auth_store" / "bili_auth.json"
 
-# 🚨 签名变更为接收 vid_candidates 字典
 async def upload_video_bilibili(vid_candidates: dict, dynamic_title: str, dynamic_content: str, source_url: str, settings, bypass_tg: bool = False) -> tuple[bool, str]:
     avail_trans = vid_candidates.get("translated")
     avail_orig = vid_candidates.get("original")
@@ -22,15 +20,10 @@ async def upload_video_bilibili(vid_candidates: dict, dynamic_title: str, dynami
         logger.error("❌ 没有合法的视频路径可以发布。")
         return False, ""
 
-    # ==========================================
-    # 1. 挂起管线，TG 人工审核 / 或者是测试直通
-    # ==========================================
     if not bypass_tg:
         logger.info("⏸️ 正在挂起管线，等待主理人从 Telegram 预览截帧并选择投递版本...")
-        # 将双版本选项送往 TG
         hitl_data = await ask_video_approval(vid_candidates, dynamic_content)
         
-        # 判断主理人是否拒绝，或由于其他原因未能选中有效路径
         if not hitl_data or 'selected_path' not in hitl_data or not hitl_data['selected_path']:
             logger.warning("🚫 主理人已在 Telegram 拒绝本次视频发布任务。")
             await send_tg_msg("🚫 <b>已取消</b>\n该视频投递任务已被您手动取消。")
@@ -53,13 +46,9 @@ async def upload_video_bilibili(vid_candidates: dict, dynamic_title: str, dynami
     custom_tid = hitl_data.get('video_tid', getattr(bili_config, 'video_tid', 171))
     custom_tags = hitl_data.get('video_tags', getattr(bili_config, 'video_tags', "地下偶像"))
     
-    # 🚨 终极安全裁切阀：确保无论如何都不会因为越界导致发包 JSON 失败
     safe_desc = dynamic_content[:240]
     safe_dynamic = dynamic_content[:220]
 
-    # ==========================================
-    # 2. 读取本地扫码凭证，组装不可击破的浏览器外壳
-    # ==========================================
     if not AUTH_FILE.exists():
         err = "找不到 bili_auth.json，请运行扫码脚本！"
         logger.error(f"❌ {err}")
@@ -91,13 +80,10 @@ async def upload_video_bilibili(vid_candidates: dict, dynamic_title: str, dynami
     }
 
     async with aiohttp.ClientSession(headers=headers) as session:
-        # 🚨 使用经过 TG 抉择后的终极 video_path
         total_size = os.path.getsize(video_path)
         logger.info(f"📤 [视频引擎] 准备上传视频: {os.path.basename(video_path)}")
 
-        # ==========================================
-        # 3. 申请节点 (防 403 物理盾测试 + 拦截熔断)
-        # ==========================================
+        # 🚨 止血点 1：为申请节点接口加装防抖循环
         pre_url = "https://member.bilibili.com/preupload"
         params = {
             'os': 'upos', 'r': 'upos', 'profile': 'ugcupos/bup', 'ssl': 0,
@@ -106,12 +92,20 @@ async def upload_video_bilibili(vid_candidates: dict, dynamic_title: str, dynami
             'upcdn': 'bda2', 'probe_version': '20221109'
         }
         
-        async with session.get(pre_url, params=params) as resp:
-            if resp.status in [401, 403]:
-                raise RuntimeError(f"AUTH_EXPIRED: 申请节点遭遇 HTTP {resp.status} 拦截！")
-            ret = await resp.json()
-            if ret.get("code") == -101:
-                raise RuntimeError("AUTH_EXPIRED: Preupload 返回 -101 账号未登录。")
+        for attempt in range(3):
+            try:
+                async with session.get(pre_url, params=params, timeout=15) as resp:
+                    if resp.status in [401, 403]:
+                        raise RuntimeError(f"AUTH_EXPIRED: 申请节点遭遇 HTTP {resp.status} 拦截！")
+                    ret = await resp.json()
+                    if ret.get("code") == -101:
+                        raise RuntimeError("AUTH_EXPIRED: Preupload 返回 -101 账号未登录。")
+                    break # 请求成功，跳出重试
+            except RuntimeError as e: raise e
+            except Exception as e:
+                if attempt == 2: raise Exception(f"申请节点彻底失败: {e}")
+                logger.warning(f"⚠️ 节点申请网络波动，准备重试: {e}")
+                await asyncio.sleep(2)
 
         auth = ret['auth']
         upos_uri = ret['upos_uri']
@@ -120,9 +114,7 @@ async def upload_video_bilibili(vid_candidates: dict, dynamic_title: str, dynami
         upos_url = f"https:{ret['endpoint']}/{upos_uri.replace('upos://', '')}"
         upos_headers = {"X-Upos-Auth": auth, "User-Agent": headers["user-agent"]}
 
-        # ==========================================
-        # 4. 高并发切片物理传输
-        # ==========================================
+        # 高并发分片上传（已自带 attempt 防抖机制）
         async with session.post(f"{upos_url}?uploads&output=json", headers=upos_headers) as resp:
             upload_id = (await resp.json())["upload_id"]
 
@@ -140,7 +132,7 @@ async def upload_video_bilibili(vid_candidates: dict, dynamic_title: str, dynami
             async with sem:
                 for attempt in range(3):
                     try:
-                        async with session.put(upos_url, params=chunk_params, data=chunk_data, headers=upos_headers) as r:
+                        async with session.put(upos_url, params=chunk_params, data=chunk_data, headers=upos_headers, timeout=60) as r:
                             r.raise_for_status()
                             parts.append({"partNumber": chunk_idx + 1, "eTag": "etag"})
                             return
@@ -168,9 +160,7 @@ async def upload_video_bilibili(vid_candidates: dict, dynamic_title: str, dynami
         bili_filename = upos_uri.split('/')[-1].split('.')[0]
         logger.info(f"✅ [视频引擎] 物理文件上传成功！特征码: {bili_filename}")
 
-        # ==========================================
-        # 🎯 5. 提交元数据 (严格控制 desc 和 dynamic 容量)
-        # ==========================================
+        # 🚨 止血点 2：提交最终元数据防抖循环
         submit_url = f"https://member.bilibili.com/x/vu/web/add?csrf={bili_jct}"
         visibility = 1 if getattr(bili_config, 'visibility', 1) == 1 else 0
         
@@ -189,19 +179,26 @@ async def upload_video_bilibili(vid_candidates: dict, dynamic_title: str, dynami
             "is_only_self": visibility
         }
         
-        logger.info("📡 [视频引擎] 正在提交稿件元数据 (极速降级适配版)...")
-        async with session.post(submit_url, json=payload) as resp:
-            result = await resp.json()
-            if result.get("code") == -101:
-                raise RuntimeError("AUTH_EXPIRED: 提交稿件时返回 -101 账号未登录。")
-            if result.get("code") == 0:
-                bvid = result.get('data', {}).get('bvid', '')
-                logger.info(f"🎉 [视频引擎] 投稿成功！获得 BVID: {bvid}")
-                if not bypass_tg: 
-                    await send_tg_msg(f"✅ <b>视频投稿成功！</b>\n\n📌 <b>标题:</b> {safe_title}\n📺 <b>BVID:</b> <code>{bvid}</code>")
-                return True, bvid
-            else:
-                logger.error(f"❌ 稿件提交失败: {result}")
-                if not bypass_tg: 
-                    await send_tg_msg(f"❌ <b>视频投稿遭拒！</b>\nB站接口返回:\n<code>{result}</code>")
-                return False, ""
+        for attempt in range(3):
+            try:
+                logger.info(f"📡 [视频引擎] 正在提交稿件元数据 (尝试 {attempt+1}/3)...")
+                async with session.post(submit_url, json=payload, timeout=20) as resp:
+                    result = await resp.json()
+                    if result.get("code") == -101:
+                        raise RuntimeError("AUTH_EXPIRED: 提交稿件时返回 -101 账号未登录。")
+                    if result.get("code") == 0:
+                        bvid = result.get('data', {}).get('bvid', '')
+                        logger.info(f"🎉 [视频引擎] 投稿成功！获得 BVID: {bvid}")
+                        if not bypass_tg: 
+                            await send_tg_msg(f"✅ <b>视频投稿成功！</b>\n\n📌 <b>标题:</b> {safe_title}\n📺 <b>BVID:</b> <code>{bvid}</code>")
+                        return True, bvid
+                    else:
+                        raise Exception(f"B站接口业务拒绝: {result}")
+            except RuntimeError as e: raise e
+            except Exception as e:
+                if attempt == 2:
+                    logger.error(f"❌ 稿件提交彻底失败: {e}")
+                    if not bypass_tg: await send_tg_msg(f"❌ <b>视频投稿遭拒！</b>\n接口返回:\n<code>{e}</code>")
+                    return False, ""
+                logger.warning(f"⚠️ 提交稿件时网络波动: {e}，3秒后重试...")
+                await asyncio.sleep(3)

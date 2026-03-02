@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 import sys
 import re
+import time
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from common.config_loader import settings
@@ -14,6 +15,8 @@ from Bot_Media.llm_translator import translate_batch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+DATA_DIR = Path(os.getenv("LOCAL_DATA_DIR", f"./GloBot_Data/{settings.targets.group_name}"))
 
 def format_time_srt(seconds: float) -> str:
     hours, rem = divmod(seconds, 3600)
@@ -28,34 +31,27 @@ async def process_with_ai(source_file: Path, output_file: Path):
     srt_file = work_dir / f"temp_subs_{source_file.stem}.srt"
 
     try:
-        # 1. 👁️ 视觉(NPU) + 👂 听觉(FFmpeg) 并发提取
         ocr_task = asyncio.create_task(extract_video_text(source_file))
         audio_task = asyncio.create_task(extract_audio(source_file, audio_file))
         ocr_results, audio_success = await asyncio.gather(ocr_task, audio_task)
         
         if not audio_success: return
 
-        # 2. 🧠 音频转录 (MLX Whisper)
         whisper_results = await transcribe_audio(audio_file)
         segments = whisper_results.get('segments', [])
         if not segments:
             shutil.copy2(source_file, output_file)
             return
 
-        # 3. 🧬 全剧本打包翻译
         logger.info(f"🧬 开始双模态上下文融合，打包发送给 AI 翻译中...")
         cn_texts = await translate_batch(segments, ocr_results)
         
-        # 4. 📝 组装并写入本地 SRT 字幕文件 (纯净单语版)
         srt_lines = []
         for i, seg in enumerate(segments):
             start_str = format_time_srt(seg['start'])
             end_str = format_time_srt(seg['end'])
             jp_text = seg['text'].strip()
-            # 容错提取：如果翻译行数不够，才降级显示日文原文
             cn_text = cn_texts[i] if i < len(cn_texts) else jp_text
-            
-            # 💡 核心修改：去掉了末尾的 \n{jp_text}，只保留纯中文！
             srt_lines.append(f"{i + 1}\n{start_str} --> {end_str}\n{cn_text}\n")
             
         with open(srt_file, "w", encoding="utf-8") as f:
@@ -63,7 +59,6 @@ async def process_with_ai(source_file: Path, output_file: Path):
             
         logger.info("✅ SRT 单语纯净字幕生成完毕！准备唤醒苹果 HEVC 硬件编码器...")
 
-        # 5. 🔥 硬件压制
         quality = settings.media_engine.hardware_encode_quality
         srt_name = srt_file.name 
 
@@ -100,7 +95,7 @@ async def process_bypass(source_file: Path, output_file: Path):
 
 async def dispatch_media(source_file_path: str):
     source_file = Path(source_file_path)
-    PUBLISH_DIR = Path(os.getenv("LOCAL_DATA_DIR", f"./GloBot_Data/{settings.targets.group_name}")) / "ready_to_publish"
+    PUBLISH_DIR = DATA_DIR / "ready_to_publish"
     PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
     output_file = PUBLISH_DIR / f"final_{source_file.name}"
     
@@ -110,6 +105,62 @@ async def dispatch_media(source_file_path: str):
         await process_bypass(source_file, output_file)
     try: source_file.unlink()
     except: pass
+
+# ==========================================
+# 🧹 媒体综合管理暴露接口
+# ==========================================
+def cleanup_old_media(retention_days=2.0):
+    media_dir = DATA_DIR / "media"
+    if not media_dir.exists(): return
+    current_time = time.time()
+    cutoff_time = current_time - (retention_days * 24 * 3600)
+    deleted_files = 0
+    for file_path in media_dir.rglob('*'):
+        if file_path.is_file() and file_path.stat().st_mtime < cutoff_time:
+            try:
+                file_path.unlink()
+                deleted_files += 1
+            except Exception: pass
+    for member_dir in media_dir.iterdir():
+        if member_dir.is_dir() and not any(member_dir.iterdir()):
+            try: member_dir.rmdir()
+            except: pass
+    if deleted_files > 0:
+        logger.info(f"🧹 [空间管理] 触发自动清理！已永久销毁 {deleted_files} 个陈旧媒体文件。")
+
+def cleanup_media(media_paths):
+    for f in media_paths:
+        if "ready_to_publish" in str(f):
+            try: Path(f).unlink()
+            except: pass
+
+async def process_media_files(media_list):
+    final_paths = []
+    video_info = {"original": None, "translated": None}
+    
+    for mf in media_list:
+        if str(mf).lower().endswith(('.mp4', '.mov')):
+            logger.info(f"   -> 正在启动媒体管线压制视频...")
+            source_file = Path(mf)
+            PUBLISH_DIR = DATA_DIR / "ready_to_publish"
+            PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
+            
+            orig_file = PUBLISH_DIR / f"orig_{source_file.name}"
+            shutil.copy2(source_file, orig_file)
+            video_info["original"] = str(orig_file)
+            final_paths.append(str(orig_file))
+            
+            output_file = PUBLISH_DIR / f"final_{source_file.name}"
+            await dispatch_media(str(source_file))
+            
+            if output_file.exists():
+                if getattr(settings.media_engine, 'enable_ai_translation', False):
+                    video_info["translated"] = str(output_file)
+                final_paths.append(str(output_file))
+        else:
+            final_paths.append(mf)
+            
+    return final_paths, video_info
 
 if __name__ == "__main__":
     test_video = "/Users/tgmesmer/Downloads/9QXPkq3RAjeUb0JW.mp4"
