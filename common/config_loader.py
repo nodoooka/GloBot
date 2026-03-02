@@ -135,8 +135,7 @@ class AppConfig(BaseModel):
                 "   👉 解决办法：请至少开启 fetch_text 或 fetch_images。"
             )
 
-        if bili.publish_original_video and bili.publish_translated_video:
-            print("⚠️ 【警告】您同时开启了发送原版视频和翻译视频，这可能会导致向B站上传两份高度相似的稿件。")
+        # 🚨 已切除：移除了旧版关于同时开启生熟肉会重复发送的警告，适应全新的 TG 抉择架构
 
         if errors:
             print("\n" + "="*60)

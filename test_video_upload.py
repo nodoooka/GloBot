@@ -43,9 +43,9 @@ async def run_test():
     try:
         logger.info("⚡ 测试模式激活：跳过 Telegram 唤醒，直接下发本地参数...")
 
-        # 🚨 核心改动：传入 bypass_tg=True
+        # 🚨 核心修复：传入 vid_candidates 字典，模拟双版本存在的情况
         success, bvid = await upload_video_bilibili(
-            video_path=test_video_path,
+            vid_candidates={"translated": test_video_path, "original": test_video_path},
             dynamic_title=test_title,
             dynamic_content=test_content,
             source_url=test_source_url,

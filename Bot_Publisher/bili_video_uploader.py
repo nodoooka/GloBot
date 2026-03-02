@@ -12,20 +12,34 @@ logger = logging.getLogger("GloBot_VideoUp")
 # 指向我们刚建立的安全凭证库
 AUTH_FILE = Path(__file__).resolve().parent.parent / "auth_store" / "bili_auth.json"
 
-async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_content: str, source_url: str, settings, bypass_tg: bool = False) -> tuple[bool, str]:
+# 🚨 签名变更为接收 vid_candidates 字典
+async def upload_video_bilibili(vid_candidates: dict, dynamic_title: str, dynamic_content: str, source_url: str, settings, bypass_tg: bool = False) -> tuple[bool, str]:
+    avail_trans = vid_candidates.get("translated")
+    avail_orig = vid_candidates.get("original")
+    
+    preview_path = avail_trans if avail_trans else avail_orig
+    if not preview_path:
+        logger.error("❌ 没有合法的视频路径可以发布。")
+        return False, ""
+
     # ==========================================
     # 1. 挂起管线，TG 人工审核 / 或者是测试直通
     # ==========================================
     if not bypass_tg:
-        logger.info("⏸️ 正在挂起管线，等待主理人从 Telegram 预览截帧并下发元数据...")
-        hitl_data = await ask_video_approval(video_path, dynamic_content)
+        logger.info("⏸️ 正在挂起管线，等待主理人从 Telegram 预览截帧并选择投递版本...")
+        # 将双版本选项送往 TG
+        hitl_data = await ask_video_approval(vid_candidates, dynamic_content)
         
-        if not hitl_data:
+        # 判断主理人是否拒绝，或由于其他原因未能选中有效路径
+        if not hitl_data or 'selected_path' not in hitl_data or not hitl_data['selected_path']:
             logger.warning("🚫 主理人已在 Telegram 拒绝本次视频发布任务。")
             await send_tg_msg("🚫 <b>已取消</b>\n该视频投递任务已被您手动取消。")
             return False, ""
+            
+        video_path = hitl_data['selected_path']
     else:
         logger.info("🧪 [脱机测试模式] 触发跳过指令！将不呼叫 Telegram，直接使用入参强行发车...")
+        video_path = preview_path
         hitl_data = {
             'video_title': dynamic_title,
             'video_tid': getattr(settings.publishers.bilibili, 'video_tid', 171),
@@ -77,6 +91,7 @@ async def upload_video_bilibili(video_path: str, dynamic_title: str, dynamic_con
     }
 
     async with aiohttp.ClientSession(headers=headers) as session:
+        # 🚨 使用经过 TG 抉择后的终极 video_path
         total_size = os.path.getsize(video_path)
         logger.info(f"📤 [视频引擎] 准备上传视频: {os.path.basename(video_path)}")
 

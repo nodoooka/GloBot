@@ -5,6 +5,7 @@ import logging
 import asyncio
 import random
 import html
+import shutil  # 👈 新增：用于在被媒体管线吞噬前，提前备份一份生肉视频
 from Bot_Master.tg_bot import start_telegram_bot, send_tg_msg, send_tg_error, GloBotState
 import traceback
 from pathlib import Path
@@ -21,6 +22,10 @@ from common.text_sanitizer import sanitize_for_bilibili
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext.Updater").setLevel(logging.CRITICAL)
+
+# 👇 新增下面这两行，彻底屏蔽它们的碎碎念
+logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Application").setLevel(logging.WARNING)
 
 from Bot_Publisher.bili_video_uploader import upload_video_bilibili 
 
@@ -76,26 +81,36 @@ def cleanup_old_media(retention_days=2.0):
     if deleted_files > 0:
         logger.info(f"🧹 [空间管理] 触发自动清理！已永久销毁 {deleted_files} 个陈旧媒体文件。")
 
+# 🚨 重构点：返回双版本的字典结构 video_info
 async def process_media_files(media_list):
     final_paths = []
-    video_type = "none"
+    video_info = {"original": None, "translated": None}
+    
     for mf in media_list:
         if str(mf).lower().endswith(('.mp4', '.mov')):
             logger.info(f"   -> 正在启动媒体管线压制视频...")
             source_file = Path(mf)
+            
             PUBLISH_DIR = DATA_DIR / "ready_to_publish"
             PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
+            
+            # 🛡️ 在源文件被媒体引擎“阅后即焚”前，提前复制一份作为生肉选项
+            orig_file = PUBLISH_DIR / f"orig_{source_file.name}"
+            shutil.copy2(source_file, orig_file)
+            video_info["original"] = str(orig_file)
+            final_paths.append(str(orig_file))
+            
             output_file = PUBLISH_DIR / f"final_{source_file.name}"
             
             await dispatch_media(str(source_file))
             if output_file.exists():
+                if getattr(settings.media_engine, 'enable_ai_translation', False):
+                    video_info["translated"] = str(output_file)
                 final_paths.append(str(output_file))
-                video_type = "translated" if settings.media_engine.enable_ai_translation else "original"
-            else:
-                final_paths.append(str(source_file)) 
         else:
             final_paths.append(mf)
-    return final_paths, video_type
+            
+    return final_paths, video_info
 
 def cleanup_media(media_paths):
     for f in media_paths:
@@ -225,12 +240,18 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
         display_name = settings.targets.account_title_map.get(author_handle, author_display)
         
         anc_media = preprocessing_cache[anc_id]['final_media']
-        anc_video_type = preprocessing_cache[anc_id]['video_type']
+        anc_video_info = preprocessing_cache[anc_id].get('video_info', {"original": None, "translated": None})
         anc_source_url = f"https://x.com/{ancestor['author']}/status/{anc_id}"
         
-        has_anc_video = (anc_video_type == "translated" and settings.publishers.bilibili.publish_translated_video) or \
-                        (anc_video_type == "original" and settings.publishers.bilibili.publish_original_video)
-        vid_path = next((p for p in anc_media if str(p).lower().endswith('.mp4')), None) if has_anc_video else None
+        allow_trans = settings.publishers.bilibili.publish_translated_video
+        allow_orig = settings.publishers.bilibili.publish_original_video
+        
+        avail_trans = anc_video_info.get("translated") if allow_trans else None
+        avail_orig = anc_video_info.get("original") if allow_orig else None
+        
+        vid_candidates = {"translated": avail_trans, "original": avail_orig}
+        has_anc_video = bool(avail_trans or avail_orig)
+        anc_video_type = "translated" if avail_trans else "original" if avail_orig else "none"
         has_any_media = len(anc_media) > 0
         
         is_video_route = False
@@ -247,14 +268,14 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
 
             fallback_to_publish = has_any_media or str(real_prev_dyn_id).startswith("BV")
             if fallback_to_publish:
-                is_video_route = bool(vid_path)
+                is_video_route = has_anc_video
                 ref_link = f"https://www.bilibili.com/video/{prev_dyn_id}" if str(prev_dyn_id).startswith("BV") else f"https://t.bilibili.com/{prev_dyn_id}"
                 curr_publish_mode = "original"
             else:
                 is_video_route = False
                 curr_publish_mode = "repost"
         else:
-            is_video_route = bool(vid_path)
+            is_video_route = has_anc_video
             curr_publish_mode = "original"
 
         limit = 220 if is_video_route else 950
@@ -269,9 +290,9 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
 
         if prev_dyn_id:
             if fallback_to_publish:
-                if vid_path:
+                if has_anc_video:
                     logger.info(f"   -> 🆕 [智能降级] 含媒体/反查拦截，转为独立视频投稿 (附溯源)...")
-                    success, new_anc_dyn_id = await upload_video_bilibili(vid_path, display_name[:80] if anc_node_type != 'REPLY' else f"{display_name}的视频回复", anc_content, anc_source_url, settings)
+                    success, new_anc_dyn_id = await upload_video_bilibili(vid_candidates, display_name[:80] if anc_node_type != 'REPLY' else f"{display_name}的视频回复", anc_content, anc_source_url, settings)
                 else:
                     logger.info(f"   -> 🆕 [智能降级] 含媒体/反查拦截，转为独立图文动态 (附溯源)...")
                     success, new_anc_dyn_id = await smart_publish(anc_content, anc_media, video_type=anc_video_type)
@@ -279,9 +300,9 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
                 logger.info(f"   -> 🔄 触发 B 站原生纯文本转发机制...")
                 success, new_anc_dyn_id = await smart_repost(anc_content, real_prev_dyn_id)
         else:
-            if vid_path:
+            if has_anc_video:
                 logger.info(f"   -> 🆕 [祖先节点] 移交视频投稿中枢...")
-                success, new_anc_dyn_id = await upload_video_bilibili(vid_path, display_name[:80] if anc_node_type != 'REPLY' else f"{display_name}的视频回复", anc_content, anc_source_url, settings)
+                success, new_anc_dyn_id = await upload_video_bilibili(vid_candidates, display_name[:80] if anc_node_type != 'REPLY' else f"{display_name}的视频回复", anc_content, anc_source_url, settings)
             else:
                 logger.info(f"   -> 🆕 正在将推文树的最底层根节点进行首发...")
                 success, new_anc_dyn_id = await smart_publish(anc_content, anc_media, video_type=anc_video_type)
@@ -318,12 +339,19 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
     clean_raw_text = "" if tw_node_type == 'RETWEET' else html.unescape(tweet['text'])
     
     final_media = [] if tw_node_type == 'RETWEET' else preprocessing_cache[tw_id]['final_media']
-    video_type = "none" if tw_node_type == 'RETWEET' else preprocessing_cache[tw_id]['video_type']
-    has_final_video = (video_type == "translated" and settings.publishers.bilibili.publish_translated_video) or \
-                      (video_type == "original" and settings.publishers.bilibili.publish_original_video)
-    vid_path = next((p for p in final_media if str(p).lower().endswith('.mp4')), None) if has_final_video else None
-    has_any_media = len(final_media) > 0 
+    tw_video_info = {} if tw_node_type == 'RETWEET' else preprocessing_cache[tw_id].get('video_info', {"original": None, "translated": None})
     final_source_url = f"https://x.com/{tweet['author']}/status/{tw_id}"
+
+    allow_trans = settings.publishers.bilibili.publish_translated_video
+    allow_orig = settings.publishers.bilibili.publish_original_video
+
+    avail_trans = tw_video_info.get("translated") if allow_trans else None
+    avail_orig = tw_video_info.get("original") if allow_orig else None
+
+    vid_candidates = {"translated": avail_trans, "original": avail_orig}
+    has_final_video = bool(avail_trans or avail_orig)
+    leaf_video_type = "translated" if avail_trans else "original" if avail_orig else "none"
+    has_any_media = len(final_media) > 0 
 
     is_video_route = False
     fallback_to_publish = False
@@ -338,14 +366,14 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
 
         fallback_to_publish = has_any_media or str(real_prev_dyn_id).startswith("BV")
         if fallback_to_publish:
-            is_video_route = bool(vid_path)
+            is_video_route = has_final_video
             ref_link = f"https://www.bilibili.com/video/{prev_dyn_id}" if str(prev_dyn_id).startswith("BV") else f"https://t.bilibili.com/{prev_dyn_id}"
             curr_publish_mode = "original"
         else:
             is_video_route = False
             curr_publish_mode = "repost"
     else:
-        is_video_route = bool(vid_path)
+        is_video_route = has_final_video
         curr_publish_mode = "original"
 
     limit = 220 if is_video_route else 950
@@ -360,29 +388,30 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
 
     if prev_dyn_id:
         if fallback_to_publish:
-            if vid_path:
+            if has_final_video:
                 logger.info("   -> 🆕 [智能降级] 含媒体/反查拦截，转为独立视频投稿 (附溯源)...")
-                success, new_dyn_id = await upload_video_bilibili(vid_path, display_name[:80] if tw_node_type != 'REPLY' else f"{display_name}的视频回复", final_content, final_source_url, settings)
+                success, new_dyn_id = await upload_video_bilibili(vid_candidates, display_name[:80] if tw_node_type != 'REPLY' else f"{display_name}的视频回复", final_content, final_source_url, settings)
             else:
                 logger.info("   -> 🆕 [智能降级] 源头为视频/包含媒体，转为独立图文动态 (附视频链接)...")
-                success, new_dyn_id = await smart_publish(final_content, final_media, video_type=video_type)
+                success, new_dyn_id = await smart_publish(final_content, final_media, video_type=leaf_video_type)
         else:
             logger.info(f"   -> ♻️ 触发成员原生纯文本转发动作...")
             success, new_dyn_id = await smart_repost(final_content, real_prev_dyn_id)
     else:
-        if vid_path:
+        if has_final_video:
             logger.info("   -> 移交视频投稿中枢...")
-            success, new_dyn_id = await upload_video_bilibili(vid_path, display_name[:80] if tw_node_type != 'REPLY' else f"{display_name}的视频回复", final_content, final_source_url, settings)
+            success, new_dyn_id = await upload_video_bilibili(vid_candidates, display_name[:80] if tw_node_type != 'REPLY' else f"{display_name}的视频回复", final_content, final_source_url, settings)
         else:
             logger.info("   -> 移交图文首发中枢 (降级处理)...")
-            success, new_dyn_id = await smart_publish(final_content, final_media, video_type=video_type)
+            success, new_dyn_id = await smart_publish(final_content, final_media, video_type=leaf_video_type)
         
     cleanup_media(final_media)
     return success, new_dyn_id, curr_publish_mode
 
 async def pipeline_loop():
     logger.info("🤖 GloBot 工业流水线已启动...")
-    await start_telegram_bot()
+    # 👇 删掉或注释掉下面这一行，把它全权交给外层的 main_master 管理！
+    # await start_telegram_bot()
     is_first_run = not FIRST_RUN_FLAG_FILE.exists()
     history_set = load_history()
     dyn_map = load_dyn_map()
@@ -393,7 +422,6 @@ async def pipeline_loop():
         try:
             await GloBotState.is_running.wait()
             
-            # 🕒 仿生作息时间拦截 (Biological Clock)
             sleep_cfg = settings.crawlers.global_settings.sleep_schedule
             if sleep_cfg.enable:
                 try:
@@ -413,7 +441,6 @@ async def pipeline_loop():
                         GloBotState.is_sleeping = True
                         GloBotState.wake_up_event.clear()
                         try: 
-                            # 采取每 10 分钟轮询一次的柔性睡眠，以支持 /force 强制唤醒
                             await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=600)
                             logger.info("⚡ 收到强制唤醒信号，提前结束蛰伏！")
                         except asyncio.TimeoutError: 
@@ -424,14 +451,12 @@ async def pipeline_loop():
                 except Exception as e:
                     logger.error(f"⚠️ 作息时间解析异常，忽略休眠: {e}")
 
-            # ♻️ 物理素材垃圾回收
             if time.time() - last_cleanup_time > 12 * 3600:
                 cleanup_old_media(getattr(settings.system, 'media_retention_days', 2.0))
                 last_cleanup_time = time.time()
 
             logger.info("\n📡 启动爬虫嗅探...")
             
-            # 🚨 T0 级推特账号风控熔断墙
             try:
                 await fetch_timeline()
             except RuntimeError as e:
@@ -448,7 +473,7 @@ async def pipeline_loop():
                 GloBotState.is_sleeping = True
                 GloBotState.wake_up_event.clear()
                 try: await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=60)
-                except: pass
+                except asyncio.TimeoutError: pass
                 finally: GloBotState.is_sleeping = False
                 continue
                 
@@ -465,7 +490,7 @@ async def pipeline_loop():
                 GloBotState.is_sleeping = True
                 GloBotState.wake_up_event.clear()
                 try: await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=sleep_time)
-                except: pass
+                except asyncio.TimeoutError: pass
                 finally: GloBotState.is_sleeping = False
                 continue
                 
@@ -497,8 +522,8 @@ async def pipeline_loop():
                 async def process_one(node):
                     node_id = str(node['id'])
                     async with llm_sem: trans = await translate_text(node['text'])
-                    async with comp_sem: f_media, v_type = await process_media_files(node.get('media', []))
-                    preprocessing_cache[node_id] = {'translated_text': trans, 'final_media': f_media, 'video_type': v_type}
+                    async with comp_sem: f_media, v_info = await process_media_files(node.get('media', []))
+                    preprocessing_cache[node_id] = {'translated_text': trans, 'final_media': f_media, 'video_info': v_info}
 
                 try:
                     await asyncio.gather(*(process_one(n) for n in unique_nodes.values()))
@@ -564,7 +589,7 @@ async def pipeline_loop():
             GloBotState.is_sleeping = True
             GloBotState.wake_up_event.clear()
             try: await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=sleep_time)
-            except: pass
+            except asyncio.TimeoutError: pass
             finally: GloBotState.is_sleeping = False
             
         except asyncio.CancelledError: break

@@ -4,6 +4,8 @@ import logging
 import asyncio
 import sqlite3
 import json
+import warnings  # 👈 新增
+from telegram.warnings import PTBUserWarning  # 👈 新增
 from pathlib import Path
 from datetime import datetime, time, timezone, timedelta
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
@@ -12,6 +14,8 @@ from telegram.error import NetworkError
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from common.config_loader import settings
+# 👇 新增：强制让 PTB 框架闭嘴，不再打印这条无害警告
+warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 logger = logging.getLogger("GloBot_Telegram")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -27,6 +31,8 @@ class GloBotState:
     crawler_task = None      
     is_sleeping = False
     wake_up_event = asyncio.Event()
+    # 👇 新增：用于在不同对话轮次之间，临时存储视频的“熟肉”与“生肉”路径
+    current_vid_candidates = {}  
 
 GloBotState.is_running.set()
 tg_app = None
@@ -177,15 +183,21 @@ async def extract_video_frames(video_path: str, num_frames=5) -> list[str]:
             
     return output_files
 
-async def ask_video_approval(video_path: str, default_desc: str) -> dict:
+# 🚨 接收 vid_candidates
+async def ask_video_approval(vid_candidates: dict, default_desc: str) -> dict:
     if not tg_app: return None
     
-    frames = await extract_video_frames(video_path, 5)
+    # 注册到全局状态机，供下一步的按钮回调提取
+    GloBotState.current_vid_candidates = vid_candidates
+    
+    # 抽取帧时使用任意一个存在的版本即可（视觉内容几乎一致）
+    preview_path = vid_candidates.get('translated') or vid_candidates.get('original')
+    frames = await extract_video_frames(preview_path, 5)
     
     msg = (f"🎬 <b>【视频发布拦截】</b>有新视频等待定稿！\n\n"
            f"<b>📝 完整动态文案:</b>\n"
            f"<code>{default_desc}</code>\n\n"
-           f"📁 视频实体: <code>{Path(video_path).name}</code>\n"
+           f"📁 视频实体: <code>{Path(preview_path).name}</code>\n"
            f"👇 <i>为您抽取了 5 张视频画面供预览参考：</i>")
     await send_tg_msg(msg)
     
@@ -236,10 +248,24 @@ async def video_hitl_preset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"标签: {preset.tags}\n\n"
         f"👉 确认无误请点击下达发射指令："
     )
-    keyboard = [
-        [InlineKeyboardButton("🚀 确认发射！", callback_data="confirm_yes")],
-        [InlineKeyboardButton("🔄 重新写标题", callback_data="confirm_no"), InlineKeyboardButton("🚫 取消发布", callback_data="confirm_cancel")]
-    ]
+    
+    # 🚨 核心逻辑：动态探明双端存在状态，并渲染出你所需要的人工二选一键盘！
+    cands = GloBotState.current_vid_candidates
+    keyboard = []
+    
+    if cands.get('translated') and cands.get('original'):
+        keyboard.append([
+            InlineKeyboardButton("✅ 发射 熟肉(AI翻译)", callback_data="confirm_translated"),
+            InlineKeyboardButton("🎵 发射 生肉(保留原声)", callback_data="confirm_original")
+        ])
+    else:
+        # 如果由于配置限制导致只有一个版本，直接降级为常规确认按钮
+        only_type = "translated" if cands.get('translated') else "original"
+        label = "✅ 发射 熟肉(AI翻译)" if only_type == "translated" else "🎵 发射 生肉(保留原声)"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"confirm_{only_type}")])
+
+    keyboard.append([InlineKeyboardButton("🔄 重新写标题", callback_data="confirm_no"), InlineKeyboardButton("🚫 取消发布", callback_data="confirm_cancel")])
+    
     await query.edit_message_text(text=summary, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     return WAIT_CONFIRM
 
@@ -248,14 +274,23 @@ async def video_hitl_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     ans = query.data
     
-    if ans == "confirm_yes":
-        await query.edit_message_text("🚀 授权成功！总线已解除挂起，正在执行 B 站视频高速推流...")
+    if ans in ["confirm_translated", "confirm_original"]:
+        vid_type = ans.split('_')[1] # translated 或 original
+        
+        # 提取主理人选中的物理路径
+        context.user_data['selected_path'] = GloBotState.current_vid_candidates.get(vid_type)
+        
+        type_name = "熟肉(AI翻译)" if vid_type == "translated" else "生肉(保留原声)"
+        await query.edit_message_text(f"🚀 授权成功！总线已解除挂起，正在以 {type_name} 版本执行高速推流...")
+        
         GloBotState.pending_video_approval.set_result(context.user_data.copy())
         context.user_data.clear()
         return ConversationHandler.END
+        
     elif ans == "confirm_no":
         await query.edit_message_text("🔄 已重置。请直接在对话框中重新回复【B站标题】:")
         return WAIT_TITLE
+        
     elif ans == "confirm_cancel":
         if GloBotState.pending_video_approval:
             GloBotState.pending_video_approval.set_result({})
