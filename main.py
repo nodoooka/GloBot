@@ -32,33 +32,63 @@ logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext.Application").setLevel(logging.WARNING)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("GloBot_Main")
+logger = logging.getLogger("GloBot_Matrix")
 
 DATA_DIR = Path(os.getenv("LOCAL_DATA_DIR", f"./GloBot_Data/{settings.targets.group_name}"))
 RAW_DIR = DATA_DIR / "timeline_raw"
 FIRST_RUN_FLAG_FILE = DATA_DIR / ".first_run_completed"
 
-async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict) -> tuple[bool, str, str]:
+# 🛡️ 全局并发状态锁，防止两个车间同时读写历史记忆导致 JSON 损坏
+state_lock = asyncio.Lock()
+
+async def safe_update_dyn_map(tweet_id, data):
+    async with state_lock:
+        dm = load_dyn_map()
+        dm[tweet_id] = data
+        save_dyn_map(dm)
+
+async def safe_add_history(tweet_id):
+    async with state_lock:
+        hs = load_history()
+        hs.add(tweet_id)
+        save_history(hs)
+
+# ==========================================
+# 🚨 终极防线：全局致命异常熔断器
+# ==========================================
+async def trigger_fatal_panic(error_type: str, error_msg: Exception):
+    if not GloBotState.is_running.is_set(): 
+        return # 已经被熔断过，防止重复发报
+    GloBotState.is_running.clear()
+    logger.critical(f"🛑 [全局熔断] 触发 T0 级警报: {error_type} - {error_msg}")
+    await send_tg_error(f"🛑 <b>{error_type}</b>\n\n异常追踪：\n<code>{error_msg}</code>\n\n系统三大引擎已全线物理挂起。修复后请发送 /resume 恢复。")
+
+# ==========================================
+# 🏭 核心执行管线 (供图文与视频车间调用)
+# ==========================================
+async def process_pipeline(tweet: dict, preprocessing_cache: dict, engine_name: str) -> tuple[bool, str, str]:
     logger.info(f"\n" + "="*50)
-    logger.info(f"🚀 开始处理推文树... 目标终点成员: @{tweet['author']}")
+    logger.info(f"🚀 [{engine_name}] 开始处理推文树... 终点成员: @{tweet['author']}")
     
     id_retention_level = getattr(settings.publishers.bilibili, 'tweet_id_retention', 0)
     prev_dyn_id, prev_tw_id = None, None 
     
     for ancestor in tweet.get('quote_chain', []):
         anc_id = str(ancestor['id'])
-        if anc_id in dyn_map:
-            prev_info = dyn_map[anc_id]
+        dm = load_dyn_map() # 每次都动态读取最新记忆，保证极高的并发一致性
+        
+        if anc_id in dm:
+            prev_info = dm[anc_id]
             prev_dyn_id = prev_info.get("dyn_id") if isinstance(prev_info, dict) else prev_info
             prev_tw_id = anc_id
             logger.info(f"   -> ♻️ 记忆寻址命中：祖先节点 {anc_id} 已搬运，跳过首发，将其作为套娃基底。")
             continue
             
         if ancestor.get('is_placeholder', False):
-            logger.info(f"   -> ⚠️ 祖先节点 {anc_id} 仅为防断链占位符且无记忆，跳过强行发布。")
+            logger.info(f"   -> ⚠️ 祖先节点 {anc_id} 为占位符，跳过发布。")
             continue
             
-        logger.info(f"   -> ⛓️ 发现全新未搬运的祖先节点！开始穿透发布: @{ancestor['author']}")
+        logger.info(f"   -> ⛓️ 发现全新祖先节点！开始穿透发布: @{ancestor['author']}")
         
         anc_node_type = ancestor.get('node_type', 'ORIGINAL')
         anc_translated = preprocessing_cache[anc_id]['translated_text']
@@ -93,7 +123,7 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
         limit = 220 if is_video_route else 950
         ref_link = f"https://www.bilibili.com/video/{prev_dyn_id}" if prev_dyn_id and str(prev_dyn_id).startswith("BV") else f"https://t.bilibili.com/{prev_dyn_id}" if prev_dyn_id else ""
         
-        context_suffix = build_repost_context(prev_tw_id, dyn_map, settings, id_retention_level, is_video_mode=is_video_route)
+        context_suffix = build_repost_context(prev_tw_id, dm, settings, id_retention_level, is_video_mode=is_video_route)
         settings.publishers.bilibili.title = "" if anc_node_type in ["REPLY", "RETWEET"] else display_name
 
         anc_content = build_safe_dynamic_text(
@@ -106,29 +136,28 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
             success, new_anc_dyn_id = await smart_repost(anc_content, real_prev_dyn_id)
         else:
             if has_anc_video:
-                logger.info(f"   -> 🆕 移交视频投稿中枢...")
+                logger.info(f"   -> 🆕 [{engine_name}] 移交视频投稿中枢...")
                 success, new_anc_dyn_id = await upload_video_bilibili(vid_candidates, display_name[:80] if anc_node_type != 'REPLY' else f"{display_name}的视频回复", anc_content, anc_source_url, settings)
             else:
-                logger.info(f"   -> 🆕 正在将节点进行首发...")
+                logger.info(f"   -> 🆕 [{engine_name}] 将图文节点进行首发...")
                 success, new_anc_dyn_id = await smart_publish(anc_content, anc_media, video_type=anc_video_type)
             
         cleanup_media(anc_media)
         
         if success and new_anc_dyn_id:
-            dyn_map[anc_id] = {
+            await safe_update_dyn_map(anc_id, {
                 "dyn_id": new_anc_dyn_id, "author_handle": author_handle, "author_display_name": author_display,
                 "node_type": anc_node_type, "dt_str": dt_str, "translated_text": anc_translated, "raw_text": clean_raw, "publish_mode": curr_publish_mode
-            }
-            save_dyn_map(dyn_map)
+            })
             prev_dyn_id, prev_tw_id = new_anc_dyn_id, anc_id
-            logger.warning("   -> ⏳ [风控规避] 祖先节点发射成功，强制开启 65 秒冷却通道...")
+            logger.warning(f"   -> ⏳ [风控规避] 祖先节点发射成功，{engine_name}强制冷却 65 秒...")
             await asyncio.sleep(65)
         else:
             logger.error(f"❌ 引用/回复 节点链条断裂，发布终止！")
             return False, "", "repost"
 
     # ==========================================
-    # 👑 第二阶段：处理成员的最终点评 (叶子节点)
+    # 处理叶子节点
     # ==========================================
     logger.info(f"   -> 👑 链路穿透完成，开始处理最终成员点评！")
     tw_id = str(tweet['id'])
@@ -163,7 +192,8 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
     limit = 220 if is_video_route else 950
     ref_link = f"https://www.bilibili.com/video/{prev_dyn_id}" if prev_dyn_id and str(prev_dyn_id).startswith("BV") else f"https://t.bilibili.com/{prev_dyn_id}" if prev_dyn_id else ""
 
-    context_suffix = build_repost_context(prev_tw_id, dyn_map, settings, id_retention_level, is_video_mode=is_video_route)
+    dm = load_dyn_map()
+    context_suffix = build_repost_context(prev_tw_id, dm, settings, id_retention_level, is_video_mode=is_video_route)
     settings.publishers.bilibili.title = "" if tw_node_type in ["REPLY", "RETWEET"] else display_name
 
     final_content = build_safe_dynamic_text(
@@ -176,199 +206,224 @@ async def process_pipeline(tweet: dict, dyn_map: dict, preprocessing_cache: dict
         success, new_dyn_id = await smart_repost(final_content, real_prev_dyn_id)
     else:
         if has_final_video:
-            logger.info("   -> 移交视频投稿中枢...")
+            logger.info(f"   -> [{engine_name}] 移交视频投稿中枢...")
             success, new_dyn_id = await upload_video_bilibili(vid_candidates, display_name[:80] if tw_node_type != 'REPLY' else f"{display_name}的视频回复", final_content, final_source_url, settings)
         else:
-            logger.info("   -> 移交图文首发中枢 (降级处理)...")
+            logger.info(f"   -> [{engine_name}] 移交图文首发中枢...")
             success, new_dyn_id = await smart_publish(final_content, final_media, video_type=leaf_video_type)
         
     cleanup_media(final_media)
     return success, new_dyn_id, curr_publish_mode
 
 
-async def pipeline_loop():
-    logger.info("🤖 GloBot 工业流水线已启动...")
-    is_first_run = not FIRST_RUN_FLAG_FILE.exists()
-    history_set = load_history()
-    dyn_map = load_dyn_map()
-    last_cleanup_time = 0
-    if is_first_run: logger.warning("🚨 检测到首次部署！首发截断保护机制已就绪。")
+# ==========================================
+# ⚙️ 独立消费者引擎：负责接收队列指令并干苦力
+# ==========================================
+async def publisher_engine(queue: asyncio.Queue, engine_name: str):
+    logger.info(f"🏭 [{engine_name}] 消费车间已上线，等待上游分发...")
     
     while True:
+        tweet = await queue.get()
+        tweet_id = str(tweet['id'])
+        
         try:
-            await GloBotState.is_running.wait()
+            await GloBotState.is_running.wait() # 如果熔断，则原地挂起，不消费队列
             
-            sleep_cfg = settings.crawlers.global_settings.sleep_schedule
-            if sleep_cfg.enable:
-                try:
-                    curr_time = datetime.now().time()
-                    t_start = datetime.strptime(sleep_cfg.start_time, "%H:%M").time()
-                    t_end = datetime.strptime(sleep_cfg.end_time, "%H:%M").time()
-                    
-                    is_sleeping_time = (t_start <= curr_time <= t_end) if t_start <= t_end else (curr_time >= t_start or curr_time <= t_end)
-                        
-                    if is_sleeping_time:
-                        logger.info(f"🌙 触发仿生休眠期 ({sleep_cfg.start_time} - {sleep_cfg.end_time})，系统进入深度蛰伏...")
-                        GloBotState.is_sleeping = True
-                        GloBotState.wake_up_event.clear()
-                        try: 
-                            await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=600)
-                            logger.info("⚡ 收到强制唤醒信号，提前结束蛰伏！")
-                        except asyncio.TimeoutError: pass
-                        finally: GloBotState.is_sleeping = False
-                        continue
-                except Exception as e:
-                    logger.error(f"⚠️ 作息时间解析异常: {e}")
-
-            if time.time() - last_cleanup_time > 12 * 3600:
-                cleanup_old_media(getattr(settings.system, 'media_retention_days', 2.0))
-                last_cleanup_time = time.time()
-
-            logger.info("\n📡 启动爬虫嗅探...")
-            try:
-                await fetch_timeline()
-            except RuntimeError as e:
-                if "TWITTER_AUTH_EXPIRED" in str(e):
-                    logger.critical(f"🛑 [熔断机制] 侦测到推特账号异常: {e}")
-                    GloBotState.is_running.clear()
-                    await send_tg_error(f"🛑 <b>推特账号疑似被风控！</b>\n\n异常追踪：\n<code>{e}</code>\n\n请更新 cookie 后发送 /resume 恢复。")
-                    continue
-                else: raise e
-                
-            json_files = list(RAW_DIR.glob("*.json"))
-            if not json_files:
-                GloBotState.is_sleeping = True
-                GloBotState.wake_up_event.clear()
-                try: await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=60)
-                except asyncio.TimeoutError: pass
-                finally: GloBotState.is_sleeping = False
-                continue
-                
-            latest_json = max(json_files, key=os.path.getmtime)
-            new_tweets = await parse_timeline_json(latest_json)
-            for jf in json_files:
-                if jf.name != latest_json.name:
-                    try: jf.unlink()
-                    except: pass
-            
-            if not new_tweets:
-                sleep_time = random.randint(240, 420)
-                logger.info(f"💤 无新动态，休眠 {sleep_time} 秒...")
-                GloBotState.is_sleeping = True
-                GloBotState.wake_up_event.clear()
-                try: await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=sleep_time)
-                except asyncio.TimeoutError: pass
-                finally: GloBotState.is_sleeping = False
-                continue
-                
-            new_tweets.sort(key=lambda x: x['timestamp'])
-            if is_first_run:
-                for t in new_tweets[:-1]: history_set.add(str(t['id']))
-                save_history(history_set)
-                new_tweets = [new_tweets[-1]]
-                FIRST_RUN_FLAG_FILE.touch()
-                is_first_run = False
-
+            dm = load_dyn_map()
             unique_nodes = {}
-            for tweet in new_tweets:
-                for anc in tweet.get('quote_chain', []):
-                    anc_id = str(anc['id'])
-                    if not anc.get('is_placeholder') and anc_id not in dyn_map and anc_id not in unique_nodes:
-                        unique_nodes[anc_id] = anc
-                tw_id = str(tweet['id'])
-                if tweet.get('node_type') != 'RETWEET':
-                    if tw_id not in unique_nodes: unique_nodes[tw_id] = tweet
+            for anc in tweet.get('quote_chain', []):
+                if not anc.get('is_placeholder') and str(anc['id']) not in dm:
+                    unique_nodes[str(anc['id'])] = anc
+            if tweet.get('node_type') != 'RETWEET':
+                unique_nodes[tweet_id] = tweet
 
-            preprocessing_cache = {}
+            cache = {}
             if unique_nodes:
                 logger.info(f"\n" + "="*50)
-                logger.info(f"⚡ [并发车间] 提取出 {len(unique_nodes)} 个独立纯净任务。")
+                logger.info(f"⚡ [{engine_name}] 开始预处理 {len(unique_nodes)} 个节点...")
                 llm_sem = asyncio.Semaphore(5)
                 comp_sem = asyncio.Semaphore(2)
 
                 async def process_one(node):
-                    node_id = str(node['id'])
+                    nid = str(node['id'])
                     async with llm_sem: trans = await translate_text(node['text'])
                     async with comp_sem: f_media, v_info = await process_media_files(node.get('media', []))
-                    preprocessing_cache[node_id] = {'translated_text': trans, 'final_media': f_media, 'video_info': v_info}
+                    cache[nid] = {'translated_text': trans, 'final_media': f_media, 'video_info': v_info}
 
                 try:
                     await asyncio.gather(*(process_one(n) for n in unique_nodes.values()))
                 except RuntimeError as e:
                     if "LLM_TRANSLATION_FAILED" in str(e):
-                        logger.critical(f"🛑 [熔断机制] 大模型翻译引擎宕机: {e}")
-                        GloBotState.is_running.clear()
-                        await send_tg_error(f"🛑 <b>大模型发生宕机！</b>\n\n<code>{e}</code>\n\n发送 /resume 恢复。")
-                        continue  
+                        await trigger_fatal_panic("大模型翻译引擎宕机", e)
+                        queue.put_nowait(tweet) # 吐回队列，等修复后重试
+                        continue
                     else: raise e
 
-            total = len(new_tweets)
-            for i, tweet in enumerate(new_tweets):
-                await GloBotState.is_running.wait()
-                tweet_id = str(tweet['id'])
-                try:
-                    success, new_dyn_id, leaf_publish_mode = await process_pipeline(tweet, dyn_map, preprocessing_cache)
-                    if success:
-                        history_set.add(tweet_id)
-                        save_history(history_set)
-                        if new_dyn_id:
-                            leaf_node_type = tweet.get('node_type', 'ORIGINAL')
-                            dyn_map[tweet_id] = {
-                                "dyn_id": new_dyn_id, "author_handle": tweet['author'], 
-                                "author_display_name": tweet.get('author_display_name', f"@{tweet['author']}"),
-                                "node_type": leaf_node_type, "dt_str": datetime.fromtimestamp(tweet['timestamp']).strftime("%Y-%m-%d %H:%M:%S"), 
-                                "translated_text": "" if leaf_node_type == 'RETWEET' else preprocessing_cache[tweet_id]['translated_text'], 
-                                "raw_text": "" if leaf_node_type == 'RETWEET' else html.unescape(tweet['text']), 
-                                "publish_mode": leaf_publish_mode
-                            }
-                            save_dyn_map(dyn_map)
-                        logger.info(f"✅ 任务 {i+1}/{total} [{tweet_id}] 成功发射！")
-                        GloBotState.daily_stats['success'] += 1 
-                        if not str(new_dyn_id).startswith("BV"): 
-                            await send_tg_msg(f"🎉 <b>图文搬运成功</b> [{i+1}/{total}]\n推特源: <code>{tweet_id}</code>\nB站动态: <code>{new_dyn_id}</code>")
-                    else:
-                        logger.error(f"❌ 推文 {tweet_id} 发布失败！")
-                        GloBotState.daily_stats['failed'] += 1   
-                        await send_tg_msg(f"❌ <b>搬运受阻</b> [{i+1}/{total}]\n推特源: <code>{tweet_id}</code>\n未能成功发布。")
-                        continue
-                except RuntimeError as e: 
-                    if "AUTH_EXPIRED" in str(e):
-                        logger.critical(f"🛑 [熔断机制] 侦测到凭证失效，强行切断流水线: {e}")
-                        GloBotState.is_running.clear() 
-                        await send_tg_error(f"🛑 <b>安全熔断机制触发！</b>\n\n<code>{e}</code>\n\n重新扫码后发送 /resume。")
-                        break 
-                    else:
-                        logger.error(f"🔥 处理推文 {tweet_id} 时发生运行时异常: {e}")
-                        GloBotState.daily_stats['failed'] += 1
-                        continue
-                except Exception as e:
-                    logger.error(f"🔥 处理推文 {tweet_id} 时发生内部崩溃: {e}")
-                    GloBotState.daily_stats['failed'] += 1
+            success, new_dyn_id, leaf_publish_mode = await process_pipeline(tweet, cache, engine_name)
+            
+            if success:
+                await safe_add_history(tweet_id)
+                if new_dyn_id:
+                    leaf_node_type = tweet.get('node_type', 'ORIGINAL')
+                    dt_str = datetime.fromtimestamp(tweet['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
+                    await safe_update_dyn_map(tweet_id, {
+                        "dyn_id": new_dyn_id, "author_handle": tweet['author'], 
+                        "author_display_name": tweet.get('author_display_name', f"@{tweet['author']}"),
+                        "node_type": leaf_node_type, "dt_str": dt_str, 
+                        "translated_text": "" if leaf_node_type == 'RETWEET' else cache[tweet_id]['translated_text'], 
+                        "raw_text": "" if leaf_node_type == 'RETWEET' else html.unescape(tweet['text']), 
+                        "publish_mode": leaf_publish_mode
+                    })
+                logger.info(f"✅ [{engine_name}] 任务 [{tweet_id}] 成功发射！")
+                GloBotState.daily_stats['success'] += 1 
+                if not str(new_dyn_id).startswith("BV"): 
+                    await send_tg_msg(f"🎉 <b>图文搬运成功</b>\n推特源: <code>{tweet_id}</code>\nB站动态: <code>{new_dyn_id}</code>")
+            else:
+                logger.error(f"❌ [{engine_name}] 推文 {tweet_id} 发布失败！")
+                GloBotState.daily_stats['failed'] += 1   
+                await send_tg_msg(f"❌ <b>搬运受阻</b>\n推特源: <code>{tweet_id}</code>\n未能成功发布。")
+                
+        except RuntimeError as e:
+            if "AUTH_EXPIRED" in str(e):
+                await trigger_fatal_panic("安全熔断机制触发 (凭证失效)", e)
+                queue.put_nowait(tweet) # 保护现场
+            else:
+                logger.error(f"🔥 [{engine_name}] 运行时异常: {e}")
+                GloBotState.daily_stats['failed'] += 1
+        except Exception as e:
+            logger.error(f"🔥 [{engine_name}] 内部崩溃: {e}")
+            GloBotState.daily_stats['failed'] += 1
+        finally:
+            queue.task_done()
+            
+        if success:
+            logger.warning(f"⏳ [{engine_name}] 单条任务完成，进入 65 秒风控冷却...")
+            await asyncio.sleep(65)
+
+# ==========================================
+# 📡 独立生产者引擎：爬虫雷达与路权分发
+# ==========================================
+async def crawler_engine(text_queue: asyncio.Queue, video_queue: asyncio.Queue):
+    logger.info("📡 [雷达引擎] 爬虫总线已上线，绝不阻塞...")
+    is_first_run = not FIRST_RUN_FLAG_FILE.exists()
+    if is_first_run: logger.warning("🚨 检测到首次部署！首发截断保护机制已就绪。")
+    last_cleanup_time = 0
+    
+    while True:
+        await GloBotState.is_running.wait()
+        
+        sleep_cfg = settings.crawlers.global_settings.sleep_schedule
+        if sleep_cfg.enable:
+            try:
+                curr_time = datetime.now().time()
+                t_start = datetime.strptime(sleep_cfg.start_time, "%H:%M").time()
+                t_end = datetime.strptime(sleep_cfg.end_time, "%H:%M").time()
+                is_sleeping_time = (t_start <= curr_time <= t_end) if t_start <= t_end else (curr_time >= t_start or curr_time <= t_end)
+                    
+                if is_sleeping_time:
+                    logger.info(f"🌙 触发仿生休眠期 ({sleep_cfg.start_time} - {sleep_cfg.end_time})，系统进入深度蛰伏...")
+                    GloBotState.is_sleeping = True
+                    GloBotState.wake_up_event.clear()
+                    try: 
+                        await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=600)
+                        logger.info("⚡ 收到强制唤醒信号，提前结束蛰伏！")
+                    except asyncio.TimeoutError: pass
+                    finally: GloBotState.is_sleeping = False
                     continue
-                    
-                if i < total - 1:
-                    logger.warning("⏳ [风控规避] 单个成员任务完成，休眠 65 秒进入下一任务...")
-                    await asyncio.sleep(65)
-                    
+            except Exception as e: pass
+
+        if time.time() - last_cleanup_time > 12 * 3600:
+            cleanup_old_media(getattr(settings.system, 'media_retention_days', 2.0))
+            last_cleanup_time = time.time()
+
+        logger.info("\n📡 启动爬虫嗅探...")
+        try:
+            await fetch_timeline()
+        except RuntimeError as e:
+            if "TWITTER_AUTH_EXPIRED" in str(e):
+                await trigger_fatal_panic("推特爬虫账号疑似被风控", e)
+                continue
+            else: raise e
+            
+        json_files = list(RAW_DIR.glob("*.json"))
+        if not json_files:
+            GloBotState.is_sleeping = True
+            GloBotState.wake_up_event.clear()
+            try: await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=60)
+            except asyncio.TimeoutError: pass
+            finally: GloBotState.is_sleeping = False
+            continue
+            
+        latest_json = max(json_files, key=os.path.getmtime)
+        new_tweets = await parse_timeline_json(latest_json)
+        for jf in json_files:
+            if jf.name != latest_json.name:
+                try: jf.unlink()
+                except: pass
+        
+        if not new_tweets:
             sleep_time = random.randint(240, 420)
-            logger.info(f"✅ 周期巡视完成，深度休眠 {sleep_time} 秒...")
+            logger.info(f"💤 无新动态，雷达休眠 {sleep_time} 秒...")
             GloBotState.is_sleeping = True
             GloBotState.wake_up_event.clear()
             try: await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=sleep_time)
             except asyncio.TimeoutError: pass
             finally: GloBotState.is_sleeping = False
+            continue
             
-        except asyncio.CancelledError: break
-        except Exception as e:
-            logger.error(f"🔥 总线发生未捕获异常: {e}")
-            await asyncio.sleep(60)
+        new_tweets.sort(key=lambda x: x['timestamp'])
+        if is_first_run:
+            # 🚨 首发防海量爆发机制：只将最后一条送进队列，其余全部标为历史
+            hs = load_history()
+            for t in new_tweets[:-1]: hs.add(str(t['id']))
+            save_history(hs)
+            new_tweets = [new_tweets[-1]]
+            FIRST_RUN_FLAG_FILE.touch()
+            is_first_run = False
+
+        for tweet in new_tweets:
+            has_video = False
+            # 只要这个推文或其祖先引用链里有视频，就全权交给重装甲去拉取和压制
+            for node in tweet.get('quote_chain', []) + [tweet]:
+                media = node.get('media', [])
+                if any(str(m).lower().endswith(('.mp4', '.mov')) for m in media):
+                    has_video = True
+                    break
+            
+            if has_video:
+                logger.info(f"   -> 🔀 [流转分发] 甄别出视频流，投递给【视频重装甲】: {tweet['id']}")
+                await video_queue.put(tweet)
+            else:
+                logger.info(f"   -> 🔀 [流转分发] 纯图文流，投递给【图文轻骑兵】: {tweet['id']}")
+                await text_queue.put(tweet)
+                
+        sleep_time = random.randint(240, 420)
+        logger.info(f"✅ 雷达周期巡视完成，深度休眠 {sleep_time} 秒...")
+        GloBotState.is_sleeping = True
+        GloBotState.wake_up_event.clear()
+        try: await asyncio.wait_for(GloBotState.wake_up_event.wait(), timeout=sleep_time)
+        except asyncio.TimeoutError: pass
+        finally: GloBotState.is_sleeping = False
+
+# ==========================================
+# 🧠 总线调度器：三引擎并发
+# ==========================================
+async def pipeline_loop():
+    text_queue = asyncio.Queue()
+    video_queue = asyncio.Queue()
+    
+    task_crawler = asyncio.create_task(crawler_engine(text_queue, video_queue))
+    task_text = asyncio.create_task(publisher_engine(text_queue, "图文轻骑兵"))
+    task_video = asyncio.create_task(publisher_engine(video_queue, "视频重装甲"))
+    
+    await asyncio.gather(task_crawler, task_text, task_video)
 
 async def main_master():
     logger.info("🤖 初始化 Telegram 中枢...")
     GloBotState.main_loop_coro = pipeline_loop
     await start_telegram_bot()
     GloBotState.crawler_task = asyncio.create_task(pipeline_loop())
-    await send_tg_msg("🟢 <b>GloBot Matrix 已上线</b>")
+    await send_tg_msg("🟢 <b>GloBot Matrix 三引擎并发版已上线</b>")
     while True: await asyncio.sleep(86400)
 
 if __name__ == "__main__":

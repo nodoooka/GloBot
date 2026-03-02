@@ -27,11 +27,19 @@ async def handle_response(response: Response):
     if "graphql" in response.url and "HomeLatestTimeline" in response.url:
         try:
             json_data = await response.json()
+            
+            # 🚨 止血补丁：质量检测防线
+            # 推特的纯游标废包通常在 1~2KB 左右。真实包含推文的包必定包含 'legacy' 字段。
+            json_str = json.dumps(json_data)
+            if 'legacy' not in json_str and len(json_str) < 5000:
+                logger.debug(f"⚠️ 丢弃了一个无推文的游标探针包 (大小: {len(json_str)} bytes)")
+                return
+                
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             save_path = DATA_DIR / f"timeline_following_{timestamp}.json"
             with open(save_path, "w", encoding="utf-8") as f:
                 json.dump(json_data, f, ensure_ascii=False, indent=2)
-            logger.info(f"🎯 成功截获纯净版【正在关注】信息流！")
+            logger.info(f"🎯 成功截获纯净版【正在关注】信息流！(有效净荷: {len(json_str)} bytes)")
         except Exception as e:
             pass
 
