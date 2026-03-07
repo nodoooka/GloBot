@@ -4,6 +4,8 @@
 GloBot_Data/
 temp_downloads/
 auth_store/
+Bot_Concert/Glocutpro_Data/
+Bot_Concert/knowledge_base/
 bili_auth.json
 *.mp4
 *.jpg

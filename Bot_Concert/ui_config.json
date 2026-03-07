@@ -1,0 +1,41 @@
+{
+    "main": {
+        "font": "PingFang SC",
+        "align": "center",
+        "transform_css": "translate(-50%, -50%)",
+        "y": -350,
+        "x": 0,
+        "size": 48,
+        "color": "#ffffff",
+        "spacing": 0,
+        "stroke_c": "#000000",
+        "stroke_w": 0.5,
+        "shadow_a": 0.8
+    },
+    "call": {
+        "font": "PingFang SC",
+        "align": "center",
+        "transform_css": "translate(-50%, -50%)",
+        "y": 470,
+        "x": 0,
+        "size": 38,
+        "color": "#e580b2",
+        "spacing": -10,
+        "stroke_c": "#000000",
+        "stroke_w": 0.5,
+        "shadow_a": 0.8
+    },
+    "title": {
+        "font": "PingFang SC",
+        "align": "right",
+        "transform_css": "translate(-100%, -50%)",
+        "y": -480,
+        "x": 950,
+        "size": 32,
+        "color": "#ffcc00",
+        "spacing": 0,
+        "stroke_c": "#000000",
+        "stroke_w": 0.5,
+        "shadow_a": 0.8
+    }
+}
